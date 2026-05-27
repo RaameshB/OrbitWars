@@ -1,0 +1,13 @@
+[project]
+name = "orbitwars"
+version = "0.1.0"
+requires-python = ">=3.14"
+dependencies = [
+    "jax>=0.10.0",
+    "jaxtyping>=0.3.9",
+    "jupyterlab>=4.5.7",
+    "kaggle>=2.1.2",
+    "kaggle-environments>=1.29.1",
+    "matplotlib>=3.10.9",
+    "pandas>=3.0.3",
+]
