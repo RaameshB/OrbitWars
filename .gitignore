@@ -1,0 +1,13 @@
+# Environment variables
+.env
+
+# Python compilation
+__pycache__/
+*.pyc
+
+# Local environments
+.venv/
+.idea/
+
+# Jupyter
+.ipynb_checkpoints/

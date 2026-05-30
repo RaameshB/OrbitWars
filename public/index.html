@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OrbitWars AI Visualizer</title>
+    <style>
+        :root {
+            --primary: #6366f1;
+            --primary-hover: #4f46e5;
+            --bg-dark: #0f172a;
+            --glass-bg: rgba(30, 41, 59, 0.7);
+            --glass-border: rgba(255, 255, 255, 0.1);
+        }
+
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background-color: var(--bg-dark);
+            color: white;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            background-image: radial-gradient(circle at 50% 0%, #1e1b4b 0%, var(--bg-dark) 50%);
+        }
+
+        header {
+            margin-top: 3rem;
+            margin-bottom: 2rem;
+            text-align: center;
+        }
+
+        h1 {
+            font-size: 2.5rem;
+            font-weight: 800;
+            margin: 0;
+            background: linear-gradient(to right, #818cf8, #c084fc);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            letter-spacing: -0.05em;
+        }
+
+        p.subtitle {
+            color: #94a3b8;
+            margin-top: 0.5rem;
+            font-size: 1.1rem;
+        }
+
+        .controls {
+            display: flex;
+            gap: 1rem;
+            margin-bottom: 2rem;
+            z-index: 10;
+        }
+
+        button {
+            background: var(--glass-bg);
+            border: 1px solid var(--glass-border);
+            color: white;
+            padding: 0.75rem 1.5rem;
+            border-radius: 9999px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            backdrop-filter: blur(10px);
+            transition: all 0.2s ease-in-out;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+        }
+
+        button:hover {
+            background: rgba(255, 255, 255, 0.1);
+            transform: translateY(-2px);
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 0 15px rgba(99, 102, 241, 0.3);
+            border-color: rgba(255, 255, 255, 0.2);
+        }
+
+        button:active {
+            transform: translateY(0);
+        }
+
+        .primary-btn {
+            background: var(--primary);
+            border: none;
+        }
+
+        .primary-btn:hover {
+            background: var(--primary-hover);
+            box-shadow: 0 10px 15px -3px rgba(99, 102, 241, 0.4);
+        }
+
+        .glass-container {
+            width: 90%;
+            max-width: 900px;
+            height: 700px;
+            background: var(--glass-bg);
+            border: 1px solid var(--glass-border);
+            border-radius: 24px;
+            overflow: hidden;
+            backdrop-filter: blur(12px);
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+            display: flex;
+            flex-direction: column;
+            position: relative;
+        }
+
+        iframe {
+            width: 100%;
+            height: 100%;
+            border: none;
+            background: #ffffff; /* Kaggle env is typically light mode */
+        }
+
+        /* Loading Overlay */
+        .loading-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(15, 23, 42, 0.85);
+            backdrop-filter: blur(8px);
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.3s ease;
+            z-index: 20;
+        }
+
+        .loading-overlay.active {
+            opacity: 1;
+            pointer-events: all;
+        }
+
+        .spinner {
+            width: 50px;
+            height: 50px;
+            border: 4px solid rgba(99, 102, 241, 0.3);
+            border-radius: 50%;
+            border-top-color: var(--primary);
+            animation: spin 1s ease-in-out infinite;
+            margin-bottom: 1.5rem;
+        }
+
+        .progress-bar-container {
+            width: 60%;
+            height: 8px;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 9999px;
+            overflow: hidden;
+            margin-top: 1rem;
+        }
+
+        .progress-bar {
+            height: 100%;
+            width: 0%;
+            background: linear-gradient(to right, #6366f1, #a855f7);
+            border-radius: 9999px;
+            transition: width 1s linear;
+        }
+
+        .loading-text {
+            font-size: 1.2rem;
+            font-weight: 600;
+            color: #e2e8f0;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+
+    <header>
+        <h1>OrbitWars AI Dashboard</h1>
+        <p class="subtitle">Live continuous monitoring of the TPU Reinforcement Learning Cluster</p>
+    </header>
+
+    <div class="controls">
+        <button class="primary-btn" onclick="triggerSimulation(2)">🚀 Generate 2-Way Sim</button>
+        <button class="primary-btn" onclick="triggerSimulation(4)">🌌 Generate 4-Way Sim</button>
+    </div>
+
+    <div class="glass-container">
+        <!-- The overlay that shows when compiling -->
+        <div class="loading-overlay" id="loadingOverlay">
+            <div class="spinner"></div>
+            <div class="loading-text" id="loadingText">Compiling JAX XLA Graphs...</div>
+            <div class="progress-bar-container">
+                <div class="progress-bar" id="progressBar"></div>
+            </div>
+            <p style="color: #94a3b8; font-size: 0.9rem; margin-top: 1rem;">This process takes approximately 3 minutes.</p>
+        </div>
+        
+        <!-- The actual Kaggle HTML Replay -->
+        <iframe id="replayFrame" src="orbit_wars_replay.html" title="OrbitWars Simulation"></iframe>
+    </div>
+
+    <script>
+        // Update this URL with your actual Cloudflare Worker URL once deployed
+        const CLOUDFLARE_WORKER_URL = 'https://YOUR_WORKER.YOUR_SUBDOMAIN.workers.dev/';
+
+        async function triggerSimulation(players) {
+            const overlay = document.getElementById('loadingOverlay');
+            const progressBar = document.getElementById('progressBar');
+            const loadingText = document.getElementById('loadingText');
+            
+            // Show loading UI
+            overlay.classList.add('active');
+            progressBar.style.width = '0%';
+            
+            try {
+                // Send request to Cloudflare API Gateway
+                const response = await fetch(CLOUDFLARE_WORKER_URL, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ players: players })
+                });
+
+                if (!response.ok) {
+                    throw new Error('Failed to trigger GitHub Action');
+                }
+
+                // Start fake progress bar for ~3 minutes (180 seconds)
+                let progress = 0;
+                loadingText.innerText = `Simulating ${players}-Way Free-For-All...`;
+                
+                const interval = setInterval(() => {
+                    progress += (100 / 180); // Fills up over 180 seconds
+                    
+                    if (progress >= 30 && progress < 60) loadingText.innerText = "Downloading latest R2 checkpoints...";
+                    if (progress >= 60 && progress < 90) loadingText.innerText = "Executing physics engine rollout...";
+                    if (progress >= 90 && progress < 120) loadingText.innerText = "Rendering interactive HTML...";
+                    if (progress >= 120 && progress < 180) loadingText.innerText = "Deploying to GitHub Pages...";
+
+                    if (progress >= 100) {
+                        clearInterval(interval);
+                        progressBar.style.width = '100%';
+                        
+                        // Wait a few extra seconds for GitHub pages to finish caching
+                        setTimeout(() => {
+                            document.getElementById('replayFrame').src = 'orbit_wars_replay.html?t=' + new Date().getTime(); // cache bust
+                            overlay.classList.remove('active');
+                        }, 5000);
+                    } else {
+                        progressBar.style.width = `${progress}%`;
+                    }
+                }, 1000);
+
+            } catch (error) {
+                console.error(error);
+                loadingText.innerText = "Error: Failed to connect to API Gateway.";
+                setTimeout(() => {
+                    overlay.classList.remove('active');
+                }, 3000);
+            }
+        }
+    </script>
+</body>
+</html>

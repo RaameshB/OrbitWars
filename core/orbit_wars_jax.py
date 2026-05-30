@@ -5,26 +5,6 @@ import jax.random as jrandom
 from typing import NamedTuple
 from jaxtyping import Float, Int, Bool, Array
 
-# Named tuples for agent convenience.
-# Planets and fleets share a common [id, owner, x, y, ...] prefix.
-class Planet(NamedTuple):
-    id: float
-    owner: float
-    x: float
-    y: float
-    radius: float
-    ships: float
-    production: float
-
-class Fleet(NamedTuple):
-    id: float
-    owner: float
-    x: float
-    y: float
-    angle: float
-    from_planet_id: float
-    ships: float
-
 # ---------------------------------------------------------
 # CONSTANTS & BOARD SETUP
 # ---------------------------------------------------------
@@ -46,38 +26,21 @@ MAX_PATH_LEN = MAX_COMET_PATH_LEN = 150
 
 MAX_BODIES = MAX_PLANETS_BASE + TOTAL_COMETS
 
+MAX_EPISODE_STEPS = 500
+
 # ---------------------------------------------------------
 # VECTOR CAPS
 # ---------------------------------------------------------
-MAX_FLEETS_PER_PLANET_PER_STEP = 50
-MAX_MOVES_PER_STEP = MAX_FLEETS_PER_PLANET_PER_STEP * MAX_PLANETS_BASE # 50 fleets launched per planet per step should be plenty of overhead
-MAX_FLEET_LIFESPAN = 125
-AGENT_COUNT = 4
-MAX_FLEETS = 50_000 # A practical, large upper bound on concurrent fleets.
+# Fleet launch constants
+MAX_FLEETS_PER_PLANET_PER_STEP = 64
+MAX_MOVES_PER_STEP = MAX_FLEETS_PER_PLANET_PER_STEP * MAX_BODIES # 64 fleets launched per body per step
+MAX_FLEET_LIFESPAN = 30
+MAX_FLEETS = 7200 # Hardcoded to prevent massive state memory explosion
 
 def distance(p1, p2):
     """Euclidean distance between two points. Can be batched."""
     diff = p1 - p2
     return jnp.sqrt(jnp.sum(diff ** 2, axis=-1))
-
-def point_to_segment_distance(p, v, w):
-    """
-    Not implemented as the separate sun intersection check isn't worth another kernel launch
-    """
-    raise NotImplementedError
-
-def swept_pair_hit(A, B, P0, P1, r):
-    """
-    Continuous swept-pair collision detection.
-    This checks if a moving fleet (from A to B) collides with a moving planet (from P0 to P1)
-    within collision radius `r` at ANY continuous time `t` between [0, 1] during the tick.
-
-    It solves the quadratic inequality for distance <= radius:
-    ||(A + (B-A)t) - (P0 + (P1-P0)t)||^2 <= r^2
-
-    Not implemented as I plan on using pure math to model intersections for garrisoning.
-    """
-    raise NotImplementedError
 
 # ---------------------------------------------------------
 # GENERATION FUNCTIONS
@@ -143,8 +106,8 @@ def generate_planets(rng_key):
         tp = jnp.array([
             [id_base,     -1.0, y, x, r, ships, prod],
             [id_base + 1, -1.0, BOARD_SIZE - x, y, r, ships, prod],
-            [id_base + 2, -1.0, x, BOARD_SIZE - y, r, ships, prod],
-            [id_base + 3, -1.0, BOARD_SIZE - y, BOARD_SIZE - x, r, ships, prod]
+            [id_base + 2, -1.0, BOARD_SIZE - y, BOARD_SIZE - x, r, ships, prod],
+            [id_base + 3, -1.0, x, BOARD_SIZE - y, r, ships, prod]
         ])
 
         # Distance checks
@@ -228,8 +191,8 @@ def generate_planets(rng_key):
         tp = jnp.array([
             [id_base,     -1.0, y, x, r, ships, prod],
             [id_base + 1, -1.0, BOARD_SIZE - x, y, r, ships, prod],
-            [id_base + 2, -1.0, x, BOARD_SIZE - y, r, ships, prod],
-            [id_base + 3, -1.0, BOARD_SIZE - y, BOARD_SIZE - x, r, ships, prod]
+            [id_base + 2, -1.0, BOARD_SIZE - y, BOARD_SIZE - x, r, ships, prod],
+            [id_base + 3, -1.0, x, BOARD_SIZE - y, r, ships, prod]
         ])
 
         def check_phase2_overlap(new_planet, planets, num_planets):
@@ -292,19 +255,20 @@ def generate_comet_paths(
 ):
     assert rng is not None, "rng must be provided"
     
-    # state format: (rng_key, attempts, success_flag, best_paths, valid_mask)
+    # state format: (rng_key, attempts, success_flag, best_paths, valid_mask, visible_len)
     init_state = (
         rng,
         0,
         jnp.array(False),
         jnp.zeros((4, MAX_PATH_LEN, 2)),
-        jnp.array(0, dtype=jnp.int32) # jnp.zeros((MAX_PATH_LEN,), dtype=bool)
+        jnp.zeros((MAX_PATH_LEN,), dtype=bool),
+        jnp.array(0)
     )
     def comet_gen_cond(state):
-        _, attempts, success, _, _ = state
+        _, attempts, success, _, _, _ = state
         return (attempts < 300) & (~success)
     def comet_gen_body(state):
-        key, attempts, _, _, _ = state
+        key, attempts, _, _, _, _ = state
         key, k1, k2, k3 = jrandom.split(key, num=4)
 
         # Generate highly eccentric ellipse
@@ -444,25 +408,18 @@ def generate_comet_paths(
         shifted_idxs = jnp.clip(jnp.arange(MAX_PATH_LEN) + board_start, 0, MAX_PATH_LEN - 1)
         shifted_all_paths = all_paths[:, shifted_idxs, :]
 
-        return (key, attempts + 1, success, shifted_all_paths, visible_len)
+        return (key, attempts + 1, success, shifted_all_paths, valid_mask, visible_len)
 
     # Execute the tracing loop
     final_state = lax.while_loop(comet_gen_cond, comet_gen_body, init_state)
-    _, _, success, final_paths, final_lifespan = final_state
+    _, _, success, final_paths, final_mask, final_visible_len = final_state
     
-    return final_paths, final_lifespan, success
-
+    return final_paths, final_visible_len, success
 
 class EnvAction(NamedTuple):
     # Arrays where index `[i, j]` dictates the j-th launch from Planet ID `i`
     ships: Int[Array, "MAX_BODIES MAX_FLEETS_PER_PLANET_PER_STEP"]
     angle: Float[Array, "MAX_BODIES MAX_FLEETS_PER_PLANET_PER_STEP"]
-
-class AgentActions:
-
-
-class EnvAction(NamedTuple):
-
 
 class EnvState(NamedTuple):
     # PLANET ARRS ARE MAX_BODIES long
@@ -486,18 +443,21 @@ class EnvParams(NamedTuple):
     planet_orbital_radii: Float[Array, "MAX_BODIES"]
     
     comet_paths: Float[Array, "TOTAL_COMETS MAX_COMET_PATH_LEN 2"]
+    comet_lifespans: Int[Array, "TOTAL_COMETS"]
     is_static_planet: Bool[Array, "MAX_BODIES"]
     is_orbiting_planet: Bool[Array, "MAX_BODIES"]
     is_comet: Bool[Array, "MAX_BODIES"]
     
     angular_velocity: Float[Array, ""] # scalar
-    comet_spawn_steps: Int[Array, "MAX_BODIES"]
+    ship_speed: Float[Array, ""] # scalar
+    step: Int[Array, ""] # scalar
+    comet_spawn_steps: Int[Array, "MAX_BODIES"] 
     body_lifespans: Int[Array, "MAX_BODIES"]
 
-    ship_speed: Float[Array, ""]
+import functools
 
-@jax.jit
-def setup(rng_key: jrandom.PRNGKey) -> tuple[EnvState, EnvParams]:
+@functools.partial(jax.jit, static_argnames=('num_players',))
+def setup(rng_key: jrandom.PRNGKey, num_players: int = 4) -> tuple[EnvState, EnvParams]:
     # Fix unpack bug and grab enough keys for our pre-generation
     key, k1, k2, k3, k4, k5 = jrandom.split(rng_key, 6)
     angular_velocity = jrandom.uniform(k1, (), minval=0.025, maxval=0.05)
@@ -505,6 +465,9 @@ def setup(rng_key: jrandom.PRNGKey) -> tuple[EnvState, EnvParams]:
     # Generate base planets (Shape: [40, 7])
     base_planets = generate_planets(k2)
 
+    # Home planet assignment is done below (lines ~547-559) using jnp.where
+    # to avoid static-slice errors with traced indices.
+    
     # --- Pre-generate all Comet Waves ---
     wave_keys = jrandom.split(k3, COMET_SPAWN_STEPS.shape[0])
     all_paths, all_lifespans, all_success = jax.vmap(
@@ -566,8 +529,8 @@ def setup(rng_key: jrandom.PRNGKey) -> tuple[EnvState, EnvParams]:
 
     # --- Unified Lifespan Tracking ---
     base_lifespans = jnp.full(MAX_PLANETS_BASE, 999999, dtype=jnp.int32)
-    comet_lifespans = jnp.repeat(all_lifespans, MAX_COMETS).astype(jnp.int32)
-    body_lifespans = jnp.concatenate([base_lifespans, comet_lifespans])
+    comet_lifespans_expanded = jnp.repeat(all_lifespans, MAX_COMETS).astype(jnp.int32)
+    body_lifespans = jnp.concatenate([base_lifespans, comet_lifespans_expanded])
 
     # --- Precompute Orbital Math ---
     initial_coords = planets[:, 2:4][:, ::-1] # Swap y, x to x, y
@@ -585,11 +548,29 @@ def setup(rng_key: jrandom.PRNGKey) -> tuple[EnvState, EnvParams]:
     home_group = jrandom.randint(k5, (), 0, MAX_PLANET_GROUPS) % num_groups
     base = home_group * 4
 
-    body_indices = jnp.arange(MAX_BODIES)
-    is_home = (body_indices >= base) & (body_indices < base + AGENT_COUNT)
+    shift = jrandom.randint(key, (), 0, 4)
 
-    planet_owners_col = jnp.where(is_home, body_indices - base, planets[:, 1].astype(jnp.int32))
-    planet_ships_col  = jnp.where(is_home, 10.0, planets[:, 5])
+    body_indices = jnp.arange(MAX_BODIES)
+    
+    # Static branching on num_players
+    if num_players == 2:
+        # Assign polar opposites for 180-degree symmetry
+        p0_idx = base + (shift % 4)
+        p1_idx = base + ((shift + 2) % 4)
+        is_home_0 = body_indices == p0_idx
+        is_home_1 = body_indices == p1_idx
+        is_home = is_home_0 | is_home_1
+        
+        planet_owners_col = planets[:, 1].astype(jnp.int32)
+        planet_owners_col = jnp.where(is_home_0, 0, planet_owners_col)
+        planet_owners_col = jnp.where(is_home_1, 1, planet_owners_col)
+        planet_ships_col  = jnp.where(is_home, 10.0, planets[:, 5])
+    else:
+        # 4 player FFA (or 3)
+        is_home = (body_indices >= base) & (body_indices < base + num_players)
+        player_ids = (body_indices - base + shift) % 4
+        planet_owners_col = jnp.where(is_home, player_ids, planets[:, 1].astype(jnp.int32))
+        planet_ships_col  = jnp.where(is_home, 10.0, planets[:, 5])
 
     # planets is currently in [id, owner, y, x, radius, ships, prod] format
     # fleets is currently in [id, angle, x, y, ships]
@@ -612,58 +593,225 @@ def setup(rng_key: jrandom.PRNGKey) -> tuple[EnvState, EnvParams]:
         planet_initial_angles=initial_angles,
         planet_orbital_radii=orbital_radii,
         comet_paths=all_paths.reshape((TOTAL_COMETS, MAX_COMET_PATH_LEN, 2)),
+        comet_lifespans=comet_lifespans_expanded,
         is_static_planet=is_static,
         is_orbiting_planet=is_orbiting,
         is_comet=is_comet,
         angular_velocity=jnp.array(angular_velocity),
         comet_spawn_steps=spawn_steps,
         body_lifespans=body_lifespans,
-        ship_speed = jnp.array(6.0)
+        ship_speed = jnp.array(6.0),
+        step=jnp.array(0)
     )
 
     return state, params
 
-def step(state: EnvState, params: EnvParams, actions: EnvAction) -> EnvState:
-    # TODO: Implement JAX environment step logic
+@functools.partial(jax.jit, static_argnames=('num_players',))
+def step(state: EnvState, params: EnvParams, actions: EnvAction, num_players: int = 4):
 
-    step = state.step + 1
+    next_step = state.step + 1
     
-    # Calculate ages and safely index into the [20, 150, 2] path array
-
-    # how old each body is, in steps, accounting for the step they were spawned
-    ages = step - params.comet_spawn_steps
-    # just the ages of the comets, they're negative when they haven't been spawned
+    # ---------------------------------------------------------
+    # [1] PRE-COMPUTE PLANET POSITIONS (End of Tick)
+    # ---------------------------------------------------------
+    ages = next_step - params.comet_spawn_steps
+    
+    # Orbiting bodies
+    initial_dx = params.initial_planet_coords[:, 0] - CENTER
+    initial_dy = params.initial_planet_coords[:, 1] - CENTER
+    pr = jnp.sqrt(initial_dx**2 + initial_dy**2)
+    initial_angles = jnp.arctan2(initial_dy, initial_dx)
+    
+    current_angles = initial_angles + (params.angular_velocity * next_step)
+    orbit_x = CENTER + pr * jnp.cos(current_angles)
+    orbit_y = CENTER + pr * jnp.sin(current_angles)
+    orbit_coords = jnp.stack([orbit_x, orbit_y], axis=-1)
+    
+    # Comet bodies
     comet_ages = ages[-TOTAL_COMETS:]
-    # we restrict the ages array to be in [0, MAX_COMET_PATH_LEN-1] as we use it to index our path array
     safe_comet_ages = jnp.clip(comet_ages, 0, MAX_COMET_PATH_LEN - 1)
-    # this updates both inactive and active comets' paths
-    # a side effect of the clip op is that unspawned and despawned comets are given a position
-    raw_comet_locations = params.comet_paths[jnp.arange(TOTAL_COMETS), safe_comet_ages, :]
-    # this is the full array where we have the planet positions and the updated (raw) comet positions
-    comet_location_update = jnp.concatenate((state.planet_coords[:-TOTAL_COMETS], raw_comet_locations), axis=0)
+    idxed_comet_locations = params.comet_paths[jnp.arange(TOTAL_COMETS), safe_comet_ages, :]
     
-    # these two lines basically check if comets are actually alive, so we know which ones to actually update
-    # Instead of MAX_COMET_PATH_LEN, we perfectly replicate the original code by using the comet's specific generated lifespan!
-    spawned_comets = (0 <= ages) & (ages < params.body_lifespans)
-    active_comets = params.is_comet & spawned_comets
+    padded_comet_coords = jnp.zeros((MAX_BODIES, 2))
+    padded_comet_coords = padded_comet_coords.at[-TOTAL_COMETS:].set(idxed_comet_locations)
     
-    # once we figured out which comets are active, we update the locations of only active comets
-    comet_updated_coords = jnp.where(active_comets[:, None], comet_location_update, state.planet_coords)
-
-    # here we mask all bodies that aren't in play, ensuring we only have spawned bodies in the env
-    # We no longer need spatial OOB checks for bodies! The lifespan timeline natively filters out dead comets.
-    active_bodies = active_comets | params.is_static_planet | params.is_orbiting_planet
-
-    # now for planet position update
-    new_orbital_angles = params.planet_initial_angles + params.angular_velocity * step
-    new_orbital_ratios = jnp.stack((jnp.cos(new_orbital_angles),jnp.sin(new_orbital_angles)), axis=1)
-    new_orbital_coords = new_orbital_ratios * params.planet_orbital_radii[:, None] + CENTER
-    body_coord_update = jnp.where(params.is_orbiting_planet[:,None], new_orbital_coords, comet_updated_coords)
-
-
-
-    new_state = EnvState(
-        planet_coords=body_coord_update,
+    # Blend all realities into a single coordinate array
+    body_coord_update = jnp.where(
+        params.is_orbiting_planet[:, None], orbit_coords,
+        jnp.where(
+            params.is_comet[:, None], padded_comet_coords,
+            state.planet_coords  # Static planets just stay where they are
+        )
     )
 
-    return new_state
+    # ---------------------------------------------------------
+    # [2] ACTIVE MASKING (Cleanup Expired Entities)
+    # ---------------------------------------------------------
+    comets_oob = (body_coord_update[:, 0] < 0.0) | (body_coord_update[:, 0] > BOARD_SIZE) | \
+                 (body_coord_update[:, 1] < 0.0) | (body_coord_update[:, 1] > BOARD_SIZE)
+                 
+    # Comets have a lifespan, plus they expire if they go out of bounds
+    comet_expired = (ages >= params.body_lifespans) | comets_oob
+    active_comets = params.is_comet & (ages >= 0) & ~comet_expired
+    
+    active_bodies = active_comets | params.is_static_planet | params.is_orbiting_planet
+
+    # ---------------------------------------------------------
+    # [3] FLEET LAUNCH
+    # ---------------------------------------------------------
+    flat_ships = actions.ships.reshape(-1)
+    flat_angles = actions.angle.reshape(-1)
+    planet_idx = jnp.arange(MAX_MOVES_PER_STEP) // MAX_FLEETS_PER_PLANET_PER_STEP
+    
+    ships_requested = jnp.sum(jnp.where(actions.ships > 0, actions.ships, 0), axis=1)
+    planet_can_launch = active_bodies & (state.planet_owners != -1) & (state.planet_ships >= ships_requested)
+    
+    valid_launch = (flat_ships > 0) & planet_can_launch[planet_idx]
+    
+    # Deduct ships
+    actual_deducted = jnp.sum(jnp.where(actions.ships > 0, actions.ships, 0) * planet_can_launch[:, None], axis=1)
+    new_planet_ships = state.planet_ships - actual_deducted
+    
+    # Fleet start positions
+    start_x = state.planet_coords[planet_idx, 0] + jnp.cos(flat_angles) * (params.planet_radii[planet_idx] + 0.1)
+    start_y = state.planet_coords[planet_idx, 1] + jnp.sin(flat_angles) * (params.planet_radii[planet_idx] + 0.1)
+    flat_start_coords = jnp.stack([start_x, start_y], axis=-1)
+    flat_owners = state.planet_owners[planet_idx]
+    
+    # Rank and select into Fleet Buffer
+    launch_rank = jnp.cumsum(valid_launch) - 1
+    n_valid = jnp.sum(valid_launch)
+    
+    # Efficient O(N) scatter-add packing instead of massive O(N^2) selector matrices
+    valid_flat_ships = jnp.where(valid_launch, flat_ships, 0)
+    valid_flat_angles = jnp.where(valid_launch, flat_angles, 0.0)
+    valid_flat_owners = jnp.where(valid_launch, flat_owners, 0)
+    valid_flat_coords = jnp.where(valid_launch[:, None], flat_start_coords, 0.0)
+    
+    rank_ships = jnp.zeros(MAX_MOVES_PER_STEP, dtype=flat_ships.dtype).at[launch_rank].add(valid_flat_ships)
+    rank_angles = jnp.zeros(MAX_MOVES_PER_STEP, dtype=flat_angles.dtype).at[launch_rank].add(valid_flat_angles)
+    rank_owners = jnp.zeros(MAX_MOVES_PER_STEP, dtype=flat_owners.dtype).at[launch_rank].add(valid_flat_owners)
+    rank_coords = jnp.zeros((MAX_MOVES_PER_STEP, 2), dtype=flat_start_coords.dtype).at[launch_rank].add(valid_flat_coords)
+    
+    empty_mask = state.fleet_owners == -1
+    slot_rank = jnp.cumsum(empty_mask) - 1
+    should_fill = empty_mask & (slot_rank < n_valid)
+    safe_slot_rank = jnp.clip(slot_rank, 0, MAX_MOVES_PER_STEP - 1)
+    
+    new_fleet_owners = jnp.where(should_fill, rank_owners[safe_slot_rank], state.fleet_owners)
+    new_fleet_ship_count = jnp.where(should_fill, rank_ships[safe_slot_rank], state.fleet_ship_count)
+    new_fleet_angles = jnp.where(should_fill, rank_angles[safe_slot_rank], state.fleet_angles)
+    new_fleet_coords = jnp.where(should_fill[:, None], rank_coords[safe_slot_rank], state.fleet_coords)
+
+    # ---------------------------------------------------------
+    # [4] PRODUCTION
+    # ---------------------------------------------------------
+    prod_delta = jnp.where((state.planet_owners != -1) & active_bodies, params.planet_prod, 0)
+    new_planet_ships = new_planet_ships + prod_delta
+
+    # ---------------------------------------------------------
+    # [5] FLEET MOVEMENT
+    # ---------------------------------------------------------
+    active_fleets = new_fleet_owners != -1
+    safe_ships = jnp.maximum(new_fleet_ship_count, 1)
+    
+    raw_speed = 1.0 + (params.ship_speed - 1.0) * (jnp.log(safe_ships.astype(float)) / jnp.log(1000.0)) ** 1.5
+    speed = jnp.minimum(raw_speed, params.ship_speed)
+    
+    dx_fleet = jnp.cos(new_fleet_angles) * speed
+    dy_fleet = jnp.sin(new_fleet_angles) * speed
+    moved_fleet_coords = new_fleet_coords + jnp.stack([dx_fleet, dy_fleet], axis=-1)
+
+    # ---------------------------------------------------------
+    # [6] COLLISION DETECTION (Continuous distance, not Swept)
+    # ---------------------------------------------------------
+    # Fleet-Planet Hits (per-step distance check instead of swept quadratic)
+    dists = distance(moved_fleet_coords[:, None, :], body_coord_update[None, :, :])
+    within_radius = dists < params.planet_radii[None, :]
+    hit_matrix = within_radius & active_fleets[:, None] & active_bodies[None, :]
+    fleet_hit_planet = jnp.any(hit_matrix, axis=1)
+    
+    # Sun Hits
+    sun_dist = distance(moved_fleet_coords, jnp.array([CENTER, CENTER]))
+    fleet_hit_sun = active_fleets & (sun_dist < SUN_RADIUS)
+    
+    # OOB Hits
+    fx, fy = moved_fleet_coords[:, 0], moved_fleet_coords[:, 1]
+    fleet_oob = active_fleets & ~((fx >= 0.0) & (fx <= BOARD_SIZE) & (fy >= 0.0) & (fy <= BOARD_SIZE))
+    
+    fleet_removed = fleet_hit_planet | fleet_hit_sun | fleet_oob
+    surviving_fleets = active_fleets & ~fleet_removed
+    
+    final_fleet_owners = jnp.where(surviving_fleets, new_fleet_owners, -1)
+    final_fleet_ship_count = jnp.where(surviving_fleets, new_fleet_ship_count, 0)
+    final_fleet_angles = jnp.where(surviving_fleets, new_fleet_angles, 0.0)
+    final_fleet_coords = jnp.where(surviving_fleets[:, None], moved_fleet_coords, 0.0)
+
+    # ---------------------------------------------------------
+    # [7] COMBAT RESOLUTION
+    # ---------------------------------------------------------
+    landing_hit_matrix = hit_matrix & fleet_hit_planet[:, None]
+    
+    def ships_for_player(p):
+        hit_by_p = landing_hit_matrix & (new_fleet_owners[:, None] == p)
+        return jnp.sum(jnp.where(hit_by_p, new_fleet_ship_count[:, None], 0), axis=0)
+        
+    ships_by_player = jax.vmap(ships_for_player)(jnp.arange(num_players)).T # [MAX_BODIES, num_players]
+    
+    sorted_ships = jnp.sort(ships_by_player, axis=-1)[:, ::-1]
+    top_ships = sorted_ships[:, 0]
+    second_ships = sorted_ships[:, 1]
+    
+    survivor_ships = jnp.where(top_ships == second_ships, 0, top_ships - second_ships)
+    top_player = jnp.argmax(ships_by_player, axis=-1)
+    survivor_owner = jnp.where(survivor_ships > 0, top_player, -1)
+    
+    has_combat = jnp.any(landing_hit_matrix, axis=0) & active_bodies
+    is_friendly = has_combat & (survivor_owner == state.planet_owners) & (survivor_ships > 0)
+    is_hostile = has_combat & (survivor_owner != state.planet_owners) & (survivor_ships > 0)
+    
+    post_reinforce = new_planet_ships + jnp.where(is_friendly, survivor_ships, 0)
+    post_assault = new_planet_ships - jnp.where(is_hostile, survivor_ships, 0)
+    captured = is_hostile & (post_assault < 0)
+    
+    new_planet_ships_combat = jnp.where(
+        is_friendly, post_reinforce,
+        jnp.where(is_hostile, jnp.abs(post_assault), new_planet_ships)
+    )
+    new_planet_owners_combat = jnp.where(captured, survivor_owner, state.planet_owners)
+
+    # ---------------------------------------------------------
+    # [8] STATE ASSEMBLY & DESPAWNING
+    # ---------------------------------------------------------
+    final_planet_coords = jnp.where(active_bodies[:, None], body_coord_update, jnp.array([-99.0, -99.0]))
+    final_planet_owners = jnp.where(active_bodies, new_planet_owners_combat, -1)
+    final_planet_ships = jnp.where(active_bodies, new_planet_ships_combat, 0)
+
+    new_state = EnvState(
+        planet_owners=final_planet_owners,
+        planet_coords=final_planet_coords,
+        planet_ships=final_planet_ships,
+        fleet_ids=state.fleet_ids,
+        fleet_owners=final_fleet_owners,
+        fleet_coords=final_fleet_coords,
+        fleet_angles=final_fleet_angles,
+        fleet_ship_count=final_fleet_ship_count,
+        step=next_step
+    )
+
+    # ---------------------------------------------------------
+    # [9] SCORING & TERMINATION
+    # ---------------------------------------------------------
+    player_ids = jnp.arange(num_players)
+    owns_planet = jnp.any((final_planet_owners[:, None] == player_ids) & active_bodies[:, None], axis=0)
+    owns_fleet = jnp.any(final_fleet_owners[:, None] == player_ids, axis=0)
+    alive = owns_planet | owns_fleet
+    n_alive = jnp.sum(alive)
+    
+    terminated = (n_alive <= 1) | (next_step >= MAX_EPISODE_STEPS - 2)
+    
+    planet_score = jax.vmap(lambda p: jnp.sum(jnp.where((final_planet_owners == p) & active_bodies, final_planet_ships, 0)))(player_ids)
+    fleet_score = jax.vmap(lambda p: jnp.sum(jnp.where(final_fleet_owners == p, final_fleet_ship_count, 0)))(player_ids)
+    scores = planet_score + fleet_score
+    
+    return new_state, scores, terminated

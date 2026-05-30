@@ -1,0 +1,61 @@
+name: Deploy Simulation
+
+on:
+  repository_dispatch:
+    types: [trigger-simulation]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+
+      - name: Install AWS CLI
+        run: sudo apt-get update && sudo apt-get install -y awscli
+
+      - name: Pull Latest Checkpoint from R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+        run: |
+          mkdir -p /tmp/checkpoints_v6
+          aws s3 sync s3://${{ secrets.R2_BUCKET_NAME }}/v6/ /tmp/checkpoints_v6/ --endpoint-url ${{ secrets.R2_ENDPOINT_URL }}
+
+      - name: Install Python Dependencies
+        run: |
+          uv venv
+          source .venv/bin/activate
+          uv pip install -r <(uv pip compile pyproject.toml)
+
+      - name: Generate Replay HTML
+        run: |
+          source .venv/bin/activate
+          python scripts/generate_site.py --players ${{ github.event.client_payload.players }}
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: './public'
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
