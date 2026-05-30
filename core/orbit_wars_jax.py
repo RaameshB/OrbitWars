@@ -35,7 +35,7 @@ MAX_EPISODE_STEPS = 500
 MAX_FLEETS_PER_PLANET_PER_STEP = 64
 MAX_MOVES_PER_STEP = MAX_FLEETS_PER_PLANET_PER_STEP * MAX_BODIES # 64 fleets launched per body per step
 MAX_FLEET_LIFESPAN = 30
-MAX_FLEETS = 7200 # Hardcoded to prevent massive state memory explosion
+MAX_FLEETS = 1000 # Reduced from 7200; observed peak is ~70 fleets in a busy FFA, 1000 gives 14x headroom
 
 def distance(p1, p2):
     """Euclidean distance between two points. Can be batched."""

@@ -136,8 +136,8 @@ def rollout(top4_params, random_key, num_players=4):
             planets = planets.at[:, 4].set(params_inner.planet_radii)
             planets = planets.at[:, 5].set(state.planet_ships)
             planets = planets.at[:, 6].set(params_inner.planet_prod)
-            fleets = jnp.zeros((7200, 6))
-            fleets = fleets.at[:, 0].set(jnp.arange(7200))
+            fleets = jnp.zeros((1000, 6))
+            fleets = fleets.at[:, 0].set(jnp.arange(1000))
             rel_f_owner = jnp.where(state.fleet_owners == pid, 1.0, 
                                     jnp.where(state.fleet_owners == -1, 0.0, -1.0))
             fleets = fleets.at[:, 1].set(rel_f_owner)
