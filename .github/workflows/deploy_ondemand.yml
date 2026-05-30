@@ -47,7 +47,7 @@ jobs:
       - name: Generate Replay HTML
         run: |
           source .venv/bin/activate
-          python scripts/generate_site.py --players ${{ github.event.client_payload.players }}
+          python scripts/generate_site.py --players ${{ github.event.client_payload.players || '4' }}
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
