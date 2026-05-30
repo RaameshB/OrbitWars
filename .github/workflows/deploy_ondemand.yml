@@ -41,7 +41,6 @@ jobs:
 
       - name: Install Python Dependencies
         run: |
-          uv venv
           source .venv/bin/activate
           uv pip install -r <(uv pip compile pyproject.toml)
 
