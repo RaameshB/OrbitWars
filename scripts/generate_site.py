@@ -64,7 +64,7 @@ def calculate_intercept_angle(state, params, ships):
     safe_ships = jnp.maximum(ships, 1)
     raw_speed = 1.0 + (params.ship_speed[..., None, None] - 1.0) * (jnp.log(safe_ships.astype(float)) / jnp.log(1000.0)) ** 1.5
     v_fleet = jnp.minimum(raw_speed, params.ship_speed[..., None, None])
-    ts = jnp.arange(1, 501, dtype=jnp.float32)
+    ts = jnp.arange(1, 151, dtype=jnp.float32)
     future_steps = state.step[..., None] + ts
     pr = params.planet_orbital_radii
     initial_angles = params.planet_initial_angles
@@ -79,9 +79,9 @@ def calculate_intercept_angle(state, params, ships):
     b_idx = jnp.arange(B_dim)[:, None, None]
     c_idx = jnp.arange(20)[None, :, None]
     idxed_comet_locations = params.comet_paths[b_idx, c_idx, safe_comet_ages, :]
-    padded_comet_coords = jnp.zeros((B_dim, 60, 500, 2))
+    padded_comet_coords = jnp.zeros((B_dim, 60, 150, 2))
     padded_comet_coords = padded_comet_coords.at[:, -20:, :, :].set(idxed_comet_locations)
-    static_coords = jnp.broadcast_to(state.planet_coords[..., None, :], (B_dim, 60, 500, 2))
+    static_coords = jnp.broadcast_to(state.planet_coords[..., None, :], (B_dim, 60, 150, 2))
     future_coords = jnp.where(
         params.is_orbiting_planet[..., None, None], orbit_coords,
         jnp.where(params.is_comet[..., None, None], padded_comet_coords, static_coords)
@@ -94,7 +94,7 @@ def calculate_intercept_angle(state, params, ships):
     travel_dist = R_src + 0.1 + v_fleet[..., None] * ts[None, None, None, :]
     req_dist = dists - R_tgt
     can_reach = travel_dist >= req_dist
-    intercept_t_idx = jnp.where(jnp.any(can_reach, axis=-1), jnp.argmax(can_reach, axis=-1), 499)
+    intercept_t_idx = jnp.where(jnp.any(can_reach, axis=-1), jnp.argmax(can_reach, axis=-1), 149)
     idx = intercept_t_idx[..., None]
     ic_x = jnp.take_along_axis(tfc[..., 0], idx, axis=-1)[..., 0]
     ic_y = jnp.take_along_axis(tfc[..., 1], idx, axis=-1)[..., 0]
