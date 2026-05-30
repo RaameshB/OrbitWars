@@ -33,7 +33,7 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
         run: |
-          uv venv
+          uv venv --python 3.12
           source .venv/bin/activate
           uv pip install awscli
           mkdir -p /tmp/checkpoints_v6
