@@ -64,13 +64,13 @@ def calculate_intercept_angle(state, params, ships):
     safe_ships = jnp.maximum(ships, 1)
     raw_speed = 1.0 + (params.ship_speed[..., None, None] - 1.0) * (jnp.log(safe_ships.astype(float)) / jnp.log(1000.0)) ** 1.5
     v_fleet = jnp.minimum(raw_speed, params.ship_speed[..., None, None])
-    ts = jnp.arange(1, 151, dtype=jnp.float32)
+    ts = jnp.arange(1, 501, dtype=jnp.float32)
     future_steps = state.step[..., None] + ts
     pr = params.planet_orbital_radii
     initial_angles = params.planet_initial_angles
     current_angles = initial_angles[..., None] + (params.angular_velocity[..., None, None] * future_steps[:, None, :])
-    orbit_x = 500.0 + pr[..., None] * jnp.cos(current_angles)
-    orbit_y = 500.0 + pr[..., None] * jnp.sin(current_angles)
+    orbit_x = 50.0 + pr[..., None] * jnp.cos(current_angles)
+    orbit_y = 50.0 + pr[..., None] * jnp.sin(current_angles)
     orbit_coords = jnp.stack([orbit_x, orbit_y], axis=-1)
     ages = future_steps[:, None, :] - params.comet_spawn_steps[..., None]
     comet_ages = ages[:, -20:, :]
@@ -79,9 +79,9 @@ def calculate_intercept_angle(state, params, ships):
     b_idx = jnp.arange(B_dim)[:, None, None]
     c_idx = jnp.arange(20)[None, :, None]
     idxed_comet_locations = params.comet_paths[b_idx, c_idx, safe_comet_ages, :]
-    padded_comet_coords = jnp.zeros((B_dim, 60, 150, 2))
+    padded_comet_coords = jnp.zeros((B_dim, 60, 500, 2))
     padded_comet_coords = padded_comet_coords.at[:, -20:, :, :].set(idxed_comet_locations)
-    static_coords = jnp.broadcast_to(state.planet_coords[..., None, :], (B_dim, 60, 150, 2))
+    static_coords = jnp.broadcast_to(state.planet_coords[..., None, :], (B_dim, 60, 500, 2))
     future_coords = jnp.where(
         params.is_orbiting_planet[..., None, None], orbit_coords,
         jnp.where(params.is_comet[..., None, None], padded_comet_coords, static_coords)
@@ -94,7 +94,7 @@ def calculate_intercept_angle(state, params, ships):
     travel_dist = R_src + 0.1 + v_fleet[..., None] * ts[None, None, None, :]
     req_dist = dists - R_tgt
     can_reach = travel_dist >= req_dist
-    intercept_t_idx = jnp.where(jnp.any(can_reach, axis=-1), jnp.argmax(can_reach, axis=-1), 149)
+    intercept_t_idx = jnp.where(jnp.any(can_reach, axis=-1), jnp.argmax(can_reach, axis=-1), 499)
     idx = intercept_t_idx[..., None]
     ic_x = jnp.take_along_axis(tfc[..., 0], idx, axis=-1)[..., 0]
     ic_y = jnp.take_along_axis(tfc[..., 1], idx, axis=-1)[..., 0]
@@ -127,10 +127,10 @@ def rollout(top4_params, random_key, num_players=4):
             theta = -pid * (2 * jnp.pi / num_players)
             cos_t = jnp.cos(theta)
             sin_t = jnp.sin(theta)
-            dx = state.planet_coords[:, 0] - 500.0
-            dy = state.planet_coords[:, 1] - 500.0
-            rot_x = dx * cos_t - dy * sin_t + 500.0
-            rot_y = dx * sin_t + dy * cos_t + 500.0
+            dx = state.planet_coords[:, 0] - 50.0
+            dy = state.planet_coords[:, 1] - 50.0
+            rot_x = dx * cos_t - dy * sin_t + 50.0
+            rot_y = dx * sin_t + dy * cos_t + 50.0
             planets = planets.at[:, 2].set(rot_x)
             planets = planets.at[:, 3].set(rot_y)
             planets = planets.at[:, 4].set(params_inner.planet_radii)
@@ -142,10 +142,10 @@ def rollout(top4_params, random_key, num_players=4):
                                     jnp.where(state.fleet_owners == -1, 0.0, -1.0))
             fleets = fleets.at[:, 1].set(rel_f_owner)
             fleets = fleets.at[:, 2].set(state.fleet_angles + theta)
-            fdx = state.fleet_coords[:, 0] - 500.0
-            fdy = state.fleet_coords[:, 1] - 500.0
-            frot_x = fdx * cos_t - fdy * sin_t + 500.0
-            frot_y = fdx * sin_t + fdy * cos_t + 500.0
+            fdx = state.fleet_coords[:, 0] - 50.0
+            fdy = state.fleet_coords[:, 1] - 50.0
+            frot_x = fdx * cos_t - fdy * sin_t + 50.0
+            frot_y = fdx * sin_t + fdy * cos_t + 50.0
             fleets = fleets.at[:, 3].set(frot_x)
             fleets = fleets.at[:, 4].set(frot_y)
             fleets = fleets.at[:, 5].set(state.fleet_ship_count)
