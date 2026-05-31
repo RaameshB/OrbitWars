@@ -1,6 +1,9 @@
 name: Deploy Simulation
 
 on:
+  push:
+    branches:
+      - main
   repository_dispatch:
     types: [trigger-simulation]
   workflow_dispatch:
@@ -24,8 +27,6 @@ jobs:
 
       - name: Install uv
         run: curl -LsSf https://astral.sh/uv/install.sh | sh
-
-
 
       - name: Pull Latest Checkpoint from R2
         env:
@@ -55,7 +56,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: './public'
+          path: "./public"
 
       - name: Deploy to GitHub Pages
         id: deployment
