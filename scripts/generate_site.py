@@ -153,6 +153,14 @@ def rollout(top4_params, random_key, num_players=4):
 def compute_final_stats(states_list, num_players, player_labels):
     """Return list of dicts sorted by final ship count (rank 1 = most ships)."""
     final = states_list[-1]
+    # Debug: dump all active fleets at the final frame
+    active_mask = final.fleet_owners != -1
+    active_owners = jnp.where(active_mask, final.fleet_owners, -999)
+    active_ships  = jnp.where(active_mask, final.fleet_ship_count, 0)
+    nonzero = jnp.where(active_mask)[0]
+    print(f"  [debug] final state step={int(final.step)}, active fleets={int(jnp.sum(active_mask))}")
+    for idx in nonzero[:20]:  # cap at 20 so it doesn't flood output
+        print(f"    fleet[{int(idx)}]: owner={int(final.fleet_owners[idx])}, ships={int(final.fleet_ship_count[idx])}")
     results = []
     for pid in range(num_players):
         p_ships = int(jnp.sum(jnp.where(final.planet_owners == pid, final.planet_ships, 0)))
