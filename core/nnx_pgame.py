@@ -57,7 +57,7 @@ from typing import Tuple, Any
 class NNXPgameConfig(struct.PyTreeNode):
     buffer_size: int = 200000
     env_batch_size: int = 2048
-    pg_batch_size: int = 256
+    pg_batch_size: int = 128
     actor_lr: float = 3e-4
     critic_lr: float = 3e-4
     gamma: float = 0.99
