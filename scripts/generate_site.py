@@ -429,12 +429,11 @@ index_html = f"""<!DOCTYPE html>
     flex-shrink: 0;
   }}
 
-  /* Glass container: square on mobile (iframe is 800×800), desktop gets taller */
+  /* Glass container: square, capped at 700px, responsive on mobile */
   .glass-container {{
-    width: min(90%, calc(100vw - 1.5rem));
+    width: min(700px, calc(100vw - 1.5rem));
     max-width: 900px;
-    /* Square aspect ratio on mobile so the scaled iframe fills it cleanly */
-    height: min(700px, min(90%, calc(100vw - 1.5rem)));
+    aspect-ratio: 1;
     background: var(--glass-bg);
     border: 1px solid var(--glass-border);
     border-radius: clamp(12px, 3vw, 24px);
