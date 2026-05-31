@@ -677,9 +677,7 @@ index_html = f"""<!DOCTYPE html>
   }}
 
   window.addEventListener('resize', scaleIframes);
-  // Run once layout + resources are ready; fallback covers cached pages
-  window.addEventListener('load', scaleIframes);
-  if (document.readyState === 'complete') scaleIframes();
+  scaleIframes(); // script is at end of body — DOM and CSS are already applied
 
   function renderStats(key) {{
     const rows = STATS[key];
