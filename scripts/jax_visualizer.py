@@ -95,7 +95,7 @@ def jax_states_to_kaggle_env(states, params):
             "initial_planets": initial_planets,
             "fleets": k_fleets,
             "angular_velocity": angular_velocity,
-            "comets": k_comets,
+            "comets": [],  # renderer expects {path_index, planet_ids, paths} groups — wrong format crashes JS
             "comet_planet_ids": [],
             "next_fleet_id": 0,
             "remainingOverageTime": 60.0
