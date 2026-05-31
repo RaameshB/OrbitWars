@@ -1,6 +1,7 @@
 import numpy as np
 from kaggle_environments import make
 from kaggle_environments.utils import Struct
+from core.orbit_wars_jax import TOTAL_COMETS, MAX_COMET_PATH_LEN
 
 def jax_states_to_kaggle_env(states, params):
     """
@@ -19,6 +20,10 @@ def jax_states_to_kaggle_env(states, params):
     planet_radii = np.array(params.planet_radii)
     planet_prod = np.array(params.planet_prod)
     angular_velocity = float(np.array(params.angular_velocity))
+    comet_paths = np.array(params.comet_paths)       # [TOTAL_COMETS, MAX_COMET_PATH_LEN, 2]
+    comet_spawn_steps = np.array(params.comet_spawn_steps)  # [TOTAL_COMETS]
+    body_lifespans = np.array(params.body_lifespans)         # [MAX_BODIES]
+    comet_lifespans = body_lifespans[-TOTAL_COMETS:]         # last TOTAL_COMETS entries
     
     for state in states:
         # Convert JAX arrays to NumPy
@@ -26,13 +31,28 @@ def jax_states_to_kaggle_env(states, params):
         p_coords = np.array(state.planet_coords)
         p_ships = np.array(state.planet_ships)
         
-        f_ids = np.array(state.fleet_ids)
         f_owners = np.array(state.fleet_owners)
         f_coords = np.array(state.fleet_coords)
         f_angles = np.array(state.fleet_angles)
         f_ships = np.array(state.fleet_ship_count)
         
         step_idx = int(np.array(state.step))
+
+        # Compute active comets for this step
+        comet_ages = step_idx - comet_spawn_steps  # [TOTAL_COMETS]
+        k_comets = []
+        for ci in range(TOTAL_COMETS):
+            age = comet_ages[ci]
+            is_spawned = age >= 0
+            is_expired = age >= comet_lifespans[ci]
+            if not is_spawned or is_expired:
+                continue
+            safe_age = int(np.clip(age, 0, MAX_COMET_PATH_LEN - 1))
+            cx, cy = comet_paths[ci, safe_age, :]
+            # Skip comets that are out of board bounds
+            if cx < 0 or cx > 100 or cy < 0 or cy > 100:
+                continue
+            k_comets.append([ci, float(cx), float(cy)])
         
         # Build Kaggle planets list: [id, owner, y, x, r, ships, prod]
         k_planets = []
@@ -54,7 +74,7 @@ def jax_states_to_kaggle_env(states, params):
         for i in range(len(f_owners)):
             if f_owners[i] != -1:
                 k_fleets.append([
-                    int(f_ids[i]),           # id
+                    i,                       # id
                     int(f_owners[i]),        # owner
                     float(f_coords[i, 0]),   # x
                     float(f_coords[i, 1]),   # y
@@ -75,7 +95,7 @@ def jax_states_to_kaggle_env(states, params):
             "initial_planets": initial_planets,
             "fleets": k_fleets,
             "angular_velocity": angular_velocity,
-            "comets": [],
+            "comets": k_comets,
             "comet_planet_ids": [],
             "next_fleet_id": 0,
             "remainingOverageTime": 60.0

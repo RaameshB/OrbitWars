@@ -9,7 +9,7 @@ from jax.sharding import SingleDeviceSharding
 from jax.tree_util import tree_map
 
 from core.networks import Actor, logits_to_action
-from core.orbit_wars_jax import setup, step, EnvAction
+from core.orbit_wars_jax import setup, step, EnvAction, MAX_FLEETS
 from qdax.core.containers.mapelites_repertoire import compute_cvt_centroids, MapElitesRepertoire
 from scripts.jax_visualizer import jax_states_to_kaggle_env
 
@@ -60,7 +60,6 @@ else:
 
 def calculate_intercept_angle(state, params, ships):
     B = ships.shape[0]
-    target_ids = jnp.broadcast_to(jnp.arange(60)[None, None, :], (B, 60, 60))
     safe_ships = jnp.maximum(ships, 1)
     raw_speed = 1.0 + (params.ship_speed[..., None, None] - 1.0) * (jnp.log(safe_ships.astype(float)) / jnp.log(1000.0)) ** 1.5
     v_fleet = jnp.minimum(raw_speed, params.ship_speed[..., None, None])
@@ -74,21 +73,25 @@ def calculate_intercept_angle(state, params, ships):
     orbit_coords = jnp.stack([orbit_x, orbit_y], axis=-1)
     ages = future_steps[:, None, :] - params.comet_spawn_steps[..., None]
     comet_ages = ages[:, -20:, :]
-    safe_comet_ages = jnp.clip(comet_ages, 0, 150 - 1).astype(jnp.int32)
+    safe_comet_ages = jnp.clip(comet_ages, 0, orbit_wars_jax.MAX_COMET_PATH_LEN - 1).astype(jnp.int32)
     B_dim = safe_comet_ages.shape[0]
     b_idx = jnp.arange(B_dim)[:, None, None]
     c_idx = jnp.arange(20)[None, :, None]
     idxed_comet_locations = params.comet_paths[b_idx, c_idx, safe_comet_ages, :]
-    padded_comet_coords = jnp.zeros((B_dim, 60, 150, 2))
-    padded_comet_coords = padded_comet_coords.at[:, -20:, :, :].set(idxed_comet_locations)
+    n_planet_slots = 60 - 20
+    padded_comet_coords = jnp.concatenate([
+        jnp.zeros((B_dim, n_planet_slots, 150, 2)),
+        idxed_comet_locations,
+    ], axis=1)
     static_coords = jnp.broadcast_to(state.planet_coords[..., None, :], (B_dim, 60, 150, 2))
     future_coords = jnp.where(
         params.is_orbiting_planet[..., None, None], orbit_coords,
         jnp.where(params.is_comet[..., None, None], padded_comet_coords, static_coords)
     )
-    tfc = future_coords[b_idx, target_ids]
-    src = state.planet_coords[:, :, None, None, :]
-    dists = jnp.sqrt((tfc[..., 0] - src[..., 0])**2 + (tfc[..., 1] - src[..., 1])**2)
+    tfc = future_coords[:, None, :, :, :]  # broadcast, no gather needed
+    src = state.planet_coords[:, :, None, None, :].astype(jnp.bfloat16)
+    tfc_bf16 = tfc.astype(jnp.bfloat16)
+    dists = jnp.sqrt(((tfc_bf16[..., 0] - src[..., 0])**2 + (tfc_bf16[..., 1] - src[..., 1])**2).astype(jnp.float32) + 1e-8)
     R_src = params.planet_radii[:, :, None, None]
     R_tgt = params.planet_radii[:, None, :, None]
     travel_dist = R_src + 0.1 + v_fleet[..., None] * ts[None, None, None, :]
@@ -119,36 +122,41 @@ def rollout(top4_params, random_key, num_players=4):
         key, subkey = jax.random.split(key)
 
         def build_arrays(pid, num_players=4):
-            planets = jnp.zeros((60, 7))
-            planets = planets.at[:, 0].set(jnp.arange(60))
-            rel_p_owner = jnp.where(state.planet_owners == pid, 1.0, 
-                                    jnp.where(state.planet_owners == -1, 0.0, -1.0))
-            planets = planets.at[:, 1].set(rel_p_owner)
             theta = -pid * (2 * jnp.pi / num_players)
             cos_t = jnp.cos(theta)
             sin_t = jnp.sin(theta)
+
+            rel_p_owner = jnp.where(state.planet_owners == pid, 1.0,
+                                    jnp.where(state.planet_owners == -1, 0.0, -1.0))
             dx = state.planet_coords[:, 0] - 50.0
             dy = state.planet_coords[:, 1] - 50.0
             rot_x = dx * cos_t - dy * sin_t + 50.0
             rot_y = dx * sin_t + dy * cos_t + 50.0
-            planets = planets.at[:, 2].set(rot_x)
-            planets = planets.at[:, 3].set(rot_y)
-            planets = planets.at[:, 4].set(params_inner.planet_radii)
-            planets = planets.at[:, 5].set(state.planet_ships)
-            planets = planets.at[:, 6].set(params_inner.planet_prod)
-            fleets = jnp.zeros((1000, 6))
-            fleets = fleets.at[:, 0].set(jnp.arange(1000))
-            rel_f_owner = jnp.where(state.fleet_owners == pid, 1.0, 
+            planets = jnp.stack([
+                jnp.arange(60).astype(jnp.float32),
+                rel_p_owner,
+                rot_x,
+                rot_y,
+                params_inner.planet_radii,
+                state.planet_ships.astype(jnp.float32),
+                params_inner.planet_prod.astype(jnp.float32),
+            ], axis=-1)  # [60, 7]
+
+            rel_f_owner = jnp.where(state.fleet_owners == pid, 1.0,
                                     jnp.where(state.fleet_owners == -1, 0.0, -1.0))
-            fleets = fleets.at[:, 1].set(rel_f_owner)
-            fleets = fleets.at[:, 2].set(state.fleet_angles + theta)
             fdx = state.fleet_coords[:, 0] - 50.0
             fdy = state.fleet_coords[:, 1] - 50.0
             frot_x = fdx * cos_t - fdy * sin_t + 50.0
             frot_y = fdx * sin_t + fdy * cos_t + 50.0
-            fleets = fleets.at[:, 3].set(frot_x)
-            fleets = fleets.at[:, 4].set(frot_y)
-            fleets = fleets.at[:, 5].set(state.fleet_ship_count)
+            fleets = jnp.stack([
+                jnp.arange(MAX_FLEETS).astype(jnp.float32),
+                rel_f_owner,
+                state.fleet_angles + theta,
+                frot_x,
+                frot_y,
+                state.fleet_ship_count.astype(jnp.float32),
+            ], axis=-1)  # [MAX_FLEETS, 6]
+
             p_mask = state.planet_owners != -1
             f_mask = state.fleet_owners != -1
             return planets, fleets, p_mask, f_mask

@@ -22,7 +22,7 @@ MAX_PLANETS_BASE = MAX_PLANET_GROUPS * 4
 MAX_COMETS = 4                # Max active comets at any given time.
 COMET_SPAWN_STEPS = jnp.array([50, 150, 250, 350, 450]) # Specific turns where comets spawn.
 TOTAL_COMETS = MAX_COMETS * COMET_SPAWN_STEPS.shape[0]
-MAX_PATH_LEN = MAX_COMET_PATH_LEN = 150
+MAX_PATH_LEN = MAX_COMET_PATH_LEN = 50
 
 MAX_BODIES = MAX_PLANETS_BASE + TOTAL_COMETS
 
@@ -35,7 +35,7 @@ MAX_EPISODE_STEPS = 500
 MAX_FLEETS_PER_PLANET_PER_STEP = 64
 MAX_MOVES_PER_STEP = MAX_FLEETS_PER_PLANET_PER_STEP * MAX_BODIES # 64 fleets launched per body per step
 MAX_FLEET_LIFESPAN = 30
-MAX_FLEETS = 1000 # Reduced from 7200; observed peak is ~70 fleets in a busy FFA, 1000 gives 14x headroom
+MAX_FLEETS = 1024 # Power-of-2 for XLA alignment; observed peak is ~70 fleets in a busy FFA, 1024 gives 14x headroom
 
 def distance(p1, p2):
     """Euclidean distance between two points. Can be batched."""
@@ -423,11 +423,10 @@ class EnvAction(NamedTuple):
 
 class EnvState(NamedTuple):
     # PLANET ARRS ARE MAX_BODIES long
-    planet_owners: Int[Array, "MAX_BODIES"] 
+    planet_owners: Int[Array, "MAX_BODIES"]
     planet_coords: Float[Array, "MAX_BODIES 2"]
     planet_ships: Int[Array, "MAX_BODIES"]
-    
-    fleet_ids: Int[Array, "MAX_FLEETS"]
+
     fleet_owners: Int[Array, "MAX_FLEETS"]
     fleet_coords: Float[Array, "MAX_FLEETS 2"]
     fleet_angles: Float[Array, "MAX_FLEETS"]
@@ -578,12 +577,11 @@ def setup(rng_key: jrandom.PRNGKey, num_players: int = 4) -> tuple[EnvState, Env
         planet_owners=planet_owners_col,
         planet_coords=planets[:, 2:4][:, ::-1],  # swap y, x to x, y
         planet_ships=planet_ships_col.astype(jnp.int32),
-        fleet_ids=fleets[:, 0].astype(jnp.int32),
         fleet_owners=jnp.full(MAX_FLEETS, -1, dtype=jnp.int32),
-        fleet_coords=fleets[:, 2:4],
-        fleet_angles=fleets[:, 1],
-        fleet_ship_count=fleets[:, 4].astype(jnp.int32),
-        step = jnp.array(0),
+        fleet_coords=jnp.zeros((MAX_FLEETS, 2)),
+        fleet_angles=jnp.zeros(MAX_FLEETS),
+        fleet_ship_count=jnp.zeros(MAX_FLEETS, dtype=jnp.int32),
+        step=jnp.array(0),
     )
     
     params = EnvParams(
@@ -632,8 +630,10 @@ def step(state: EnvState, params: EnvParams, actions: EnvAction, num_players: in
     safe_comet_ages = jnp.clip(comet_ages, 0, MAX_COMET_PATH_LEN - 1)
     idxed_comet_locations = params.comet_paths[jnp.arange(TOTAL_COMETS), safe_comet_ages, :]
     
-    padded_comet_coords = jnp.zeros((MAX_BODIES, 2))
-    padded_comet_coords = padded_comet_coords.at[-TOTAL_COMETS:].set(idxed_comet_locations)
+    padded_comet_coords = jnp.concatenate([
+        jnp.zeros((MAX_BODIES - TOTAL_COMETS, 2)),
+        idxed_comet_locations,
+    ], axis=0)
     
     # Blend all realities into a single coordinate array
     body_coord_update = jnp.where(
@@ -678,20 +678,13 @@ def step(state: EnvState, params: EnvParams, actions: EnvAction, num_players: in
     flat_start_coords = jnp.stack([start_x, start_y], axis=-1)
     flat_owners = state.planet_owners[planet_idx]
     
-    # Rank and select into Fleet Buffer
-    launch_rank = jnp.cumsum(valid_launch) - 1
+    # Pack valid launches to front via stable sort on validity (valid=0, invalid=1)
     n_valid = jnp.sum(valid_launch)
-    
-    # Efficient O(N) scatter-add packing instead of massive O(N^2) selector matrices
-    valid_flat_ships = jnp.where(valid_launch, flat_ships, 0)
-    valid_flat_angles = jnp.where(valid_launch, flat_angles, 0.0)
-    valid_flat_owners = jnp.where(valid_launch, flat_owners, 0)
-    valid_flat_coords = jnp.where(valid_launch[:, None], flat_start_coords, 0.0)
-    
-    rank_ships = jnp.zeros(MAX_MOVES_PER_STEP, dtype=flat_ships.dtype).at[launch_rank].add(valid_flat_ships)
-    rank_angles = jnp.zeros(MAX_MOVES_PER_STEP, dtype=flat_angles.dtype).at[launch_rank].add(valid_flat_angles)
-    rank_owners = jnp.zeros(MAX_MOVES_PER_STEP, dtype=flat_owners.dtype).at[launch_rank].add(valid_flat_owners)
-    rank_coords = jnp.zeros((MAX_MOVES_PER_STEP, 2), dtype=flat_start_coords.dtype).at[launch_rank].add(valid_flat_coords)
+    sort_idx = jnp.argsort((~valid_launch).astype(jnp.int32), stable=True)
+    rank_ships = flat_ships[sort_idx]
+    rank_angles = flat_angles[sort_idx]
+    rank_owners = flat_owners[sort_idx]
+    rank_coords = flat_start_coords[sort_idx]
     
     empty_mask = state.fleet_owners == -1
     slot_rank = jnp.cumsum(empty_mask) - 1
@@ -752,11 +745,13 @@ def step(state: EnvState, params: EnvParams, actions: EnvAction, num_players: in
     # ---------------------------------------------------------
     landing_hit_matrix = hit_matrix & fleet_hit_planet[:, None]
     
-    def ships_for_player(p):
-        hit_by_p = landing_hit_matrix & (new_fleet_owners[:, None] == p)
-        return jnp.sum(jnp.where(hit_by_p, new_fleet_ship_count[:, None], 0), axis=0)
-        
-    ships_by_player = jax.vmap(ships_for_player)(jnp.arange(num_players)).T # [MAX_BODIES, num_players]
+    player_hit = (
+        landing_hit_matrix[:, :, None]
+        & (new_fleet_owners[:, None, None] == jnp.arange(num_players)[None, None, :])
+    )
+    ships_by_player = jnp.sum(
+        jnp.where(player_hit, new_fleet_ship_count[:, None, None], 0), axis=0
+    )  # [MAX_BODIES, num_players]
     
     sorted_ships = jnp.sort(ships_by_player, axis=-1)[:, ::-1]
     top_ships = sorted_ships[:, 0]
@@ -791,7 +786,6 @@ def step(state: EnvState, params: EnvParams, actions: EnvAction, num_players: in
         planet_owners=final_planet_owners,
         planet_coords=final_planet_coords,
         planet_ships=final_planet_ships,
-        fleet_ids=state.fleet_ids,
         fleet_owners=final_fleet_owners,
         fleet_coords=final_fleet_coords,
         fleet_angles=final_fleet_angles,

@@ -191,7 +191,8 @@ def _insert_fleet_for_player(
     send_ships = jnp.where(chosen_valid, send_ships, 0.0)
 
     updated_src_ships = src_ships - send_ships
-    planet_ships = state["planet_ships"].at[b_idx, src].set(updated_src_ships)
+    src_mask = jnp.arange(state["planet_ships"].shape[1])[None, :] == src[:, None]  # [B, num_planets]
+    planet_ships = jnp.where(src_mask, updated_src_ships[:, None], state["planet_ships"])
 
     empty_mask = ~state["fleet_alive"]
     insert_idx = jnp.argmax(empty_mask, axis=1)
@@ -203,13 +204,14 @@ def _insert_fleet_for_player(
     should_insert = has_empty & launch_attempt
     overflow_attempt = launch_attempt & (~has_empty)
 
-    idx = (b_idx, insert_idx)
-    fleet_owner = state["fleet_owner"].at[idx].set(jnp.where(should_insert, player, state["fleet_owner"][idx]))
-    fleet_x = state["fleet_x"].at[idx].set(jnp.where(should_insert, start_x, state["fleet_x"][idx]))
-    fleet_y = state["fleet_y"].at[idx].set(jnp.where(should_insert, start_y, state["fleet_y"][idx]))
-    fleet_angle = state["fleet_angle"].at[idx].set(jnp.where(should_insert, angles, state["fleet_angle"][idx]))
-    fleet_ships = state["fleet_ships"].at[idx].set(jnp.where(should_insert, send_ships, state["fleet_ships"][idx]))
-    fleet_alive = state["fleet_alive"].at[idx].set(jnp.where(should_insert, True, state["fleet_alive"][idx]))
+    slot_mask = jnp.arange(state["fleet_owner"].shape[1])[None, :] == insert_idx[:, None]  # [B, MAX_FLEETS]
+    write_mask = slot_mask & should_insert[:, None]
+    fleet_owner = jnp.where(write_mask, player, state["fleet_owner"])
+    fleet_x = jnp.where(write_mask, start_x[:, None], state["fleet_x"])
+    fleet_y = jnp.where(write_mask, start_y[:, None], state["fleet_y"])
+    fleet_angle = jnp.where(write_mask, angles[:, None], state["fleet_angle"])
+    fleet_ships = jnp.where(write_mask, send_ships[:, None], state["fleet_ships"])
+    fleet_alive = jnp.where(write_mask, True, state["fleet_alive"])
 
     state = dict(state)
     state["planet_ships"] = planet_ships
@@ -376,13 +378,15 @@ def step_fn(state: dict[str, jax.Array], action: dict[str, jax.Array], cfg: JAXO
     hit_ships = jnp.where(any_hit, state["fleet_ships"], 0.0)
     owner = jnp.where(any_hit, state["fleet_owner"], -1)
 
-    per_owner = []
-    for p in range(cfg.num_players):
-        contrib = jnp.where(owner == p, hit_ships, 0.0)
-        acc = jnp.zeros_like(state["planet_ships"])
-        acc = acc.at[jnp.arange(cfg.num_envs)[:, None], hit_pid].add(contrib)
-        per_owner.append(acc)
-    ships_by_owner = jnp.stack(per_owner, axis=-1)  # [B, P, Players]
+    # [B, MAX_FLEETS, num_players] — which fleets contribute to which owner
+    owner_match = owner[:, :, None] == jnp.arange(cfg.num_players)[None, None, :]
+    contrib_by_owner = jnp.where(owner_match, hit_ships[:, :, None], 0.0)
+    # [B, MAX_FLEETS, num_planets, num_players] — scatter fleets onto planets they hit
+    planet_match = hit_pid[:, :, None] == jnp.arange(state["planet_ships"].shape[1])[None, None, :]
+    ships_by_owner = jnp.sum(
+        jnp.where(planet_match[:, :, :, None], contrib_by_owner[:, :, None, :], 0.0),
+        axis=1
+    )  # [B, num_planets, num_players]
 
     top_idx = jnp.argmax(ships_by_owner, axis=-1)
     top_val = jnp.max(ships_by_owner, axis=-1)
