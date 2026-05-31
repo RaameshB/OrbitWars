@@ -677,8 +677,9 @@ index_html = f"""<!DOCTYPE html>
   }}
 
   window.addEventListener('resize', scaleIframes);
-  // Run after layout is stable
-  requestAnimationFrame(() => requestAnimationFrame(scaleIframes));
+  // Run once layout + resources are ready; fallback covers cached pages
+  window.addEventListener('load', scaleIframes);
+  if (document.readyState === 'complete') scaleIframes();
 
   function renderStats(key) {{
     const rows = STATS[key];
