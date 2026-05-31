@@ -283,7 +283,7 @@ index_html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>OrbitWars AI Dashboard</title>
 <style>
   :root {{
@@ -305,16 +305,18 @@ index_html = f"""<!DOCTYPE html>
     flex-direction: column;
     align-items: center;
     background-image: radial-gradient(circle at 50% 0%, #1e1b4b 0%, var(--bg-dark) 50%);
+    padding: 0 env(safe-area-inset-right) 0 env(safe-area-inset-left);
   }}
 
   header {{
-    margin-top: 2.5rem;
-    margin-bottom: 1.5rem;
+    margin-top: clamp(1rem, 4vw, 2.5rem);
+    margin-bottom: clamp(0.75rem, 3vw, 1.5rem);
     text-align: center;
+    padding: 0 1rem;
   }}
 
   h1 {{
-    font-size: 2.5rem;
+    font-size: clamp(1.4rem, 5vw, 2.5rem);
     font-weight: 800;
     margin: 0;
     background: linear-gradient(to right, #818cf8, #c084fc);
@@ -325,18 +327,24 @@ index_html = f"""<!DOCTYPE html>
 
   p.subtitle {{
     color: #94a3b8;
-    margin-top: 0.5rem;
-    font-size: 1rem;
+    margin-top: 0.4rem;
+    font-size: clamp(0.75rem, 2.5vw, 1rem);
+  }}
+
+  @media (max-width: 480px) {{
+    p.subtitle {{ display: none; }}
   }}
 
   .controls {{
     display: flex;
     flex-wrap: wrap;
-    gap: 0.75rem;
-    margin-bottom: 1rem;
+    gap: 0.5rem;
+    margin-bottom: 0.75rem;
     align-items: center;
     justify-content: center;
     z-index: 10;
+    padding: 0 0.75rem;
+    width: 100%;
   }}
 
   .toggle-group {{
@@ -352,13 +360,14 @@ index_html = f"""<!DOCTYPE html>
     background: transparent;
     border: none;
     color: #94a3b8;
-    padding: 0.5rem 1.1rem;
+    padding: clamp(0.3rem, 1.5vw, 0.5rem) clamp(0.6rem, 2.5vw, 1.1rem);
     border-radius: 9999px;
-    font-size: 0.9rem;
+    font-size: clamp(0.75rem, 2.5vw, 0.9rem);
     font-weight: 600;
     cursor: pointer;
     transition: all 0.2s ease-in-out;
     white-space: nowrap;
+    -webkit-tap-highlight-color: transparent;
   }}
 
   .toggle-btn:hover:not(:disabled) {{ color: #e2e8f0; }}
@@ -375,14 +384,14 @@ index_html = f"""<!DOCTYPE html>
     background: var(--primary);
     border: none;
     color: white;
-    padding: 0.6rem 1.4rem;
+    padding: clamp(0.4rem, 1.5vw, 0.6rem) clamp(0.9rem, 3vw, 1.4rem);
     border-radius: 9999px;
-    font-size: 0.9rem;
+    font-size: clamp(0.75rem, 2.5vw, 0.9rem);
     font-weight: 600;
     cursor: pointer;
-    backdrop-filter: blur(10px);
     transition: all 0.2s ease-in-out;
     box-shadow: 0 4px 6px -1px rgba(0,0,0,0.2);
+    -webkit-tap-highlight-color: transparent;
   }}
 
   button.primary-btn:hover {{
@@ -395,48 +404,56 @@ index_html = f"""<!DOCTYPE html>
 
   .legend {{
     display: flex;
-    gap: 14px;
+    flex-wrap: wrap;
+    gap: 10px;
     align-items: center;
-    margin-bottom: 0.75rem;
-    min-height: 22px;
+    justify-content: center;
+    margin-bottom: 0.6rem;
+    min-height: 20px;
+    padding: 0 0.75rem;
   }}
 
   .legend-item {{
     display: flex;
     align-items: center;
-    gap: 6px;
-    font-size: 0.8rem;
+    gap: 5px;
+    font-size: clamp(0.7rem, 2vw, 0.8rem);
     color: #94a3b8;
     white-space: nowrap;
   }}
 
   .swatch {{
-    width: 10px;
-    height: 10px;
+    width: 9px;
+    height: 9px;
     border-radius: 50%;
     flex-shrink: 0;
   }}
 
+  /* Glass container: square on mobile (iframe is 800×800), desktop gets taller */
   .glass-container {{
-    width: 90%;
+    width: min(90%, calc(100vw - 1.5rem));
     max-width: 900px;
-    height: 700px;
+    /* Square aspect ratio on mobile so the scaled iframe fills it cleanly */
+    height: min(700px, min(90%, calc(100vw - 1.5rem)));
     background: var(--glass-bg);
     border: 1px solid var(--glass-border);
-    border-radius: 24px;
+    border-radius: clamp(12px, 3vw, 24px);
     overflow: hidden;
     backdrop-filter: blur(12px);
     box-shadow: 0 25px 50px -12px rgba(0,0,0,0.5);
     position: relative;
-    margin-bottom: 1.25rem;
+    margin-bottom: 1rem;
   }}
 
+  /* Iframes are fixed 800×800 (Kaggle renderer); JS scales them to fit */
   iframe {{
     position: absolute;
-    inset: 0;
-    width: 100%;
-    height: 100%;
+    top: 0;
+    left: 0;
+    width: 800px;
+    height: 800px;
     border: none;
+    transform-origin: top left;
   }}
 
   .loading-overlay {{
@@ -452,32 +469,35 @@ index_html = f"""<!DOCTYPE html>
     pointer-events: none;
     transition: opacity 0.3s ease;
     z-index: 20;
-    border-radius: 24px;
+    border-radius: inherit;
+    padding: 1rem;
+    text-align: center;
   }}
 
   .loading-overlay.active {{ opacity: 1; pointer-events: all; }}
 
   .spinner {{
-    width: 48px;
-    height: 48px;
+    width: 44px;
+    height: 44px;
     border: 4px solid rgba(99, 102, 241, 0.25);
     border-radius: 50%;
     border-top-color: var(--primary);
     animation: spin 1s ease-in-out infinite;
-    margin-bottom: 1.5rem;
+    margin-bottom: 1.25rem;
+    flex-shrink: 0;
   }}
 
   @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
 
   .loading-text {{
-    font-size: 1.1rem;
+    font-size: clamp(0.85rem, 3vw, 1.1rem);
     font-weight: 600;
     color: #e2e8f0;
     margin-bottom: 1rem;
   }}
 
   .progress-bar-container {{
-    width: 55%;
+    width: min(55%, 240px);
     height: 6px;
     background: rgba(255,255,255,0.1);
     border-radius: 9999px;
@@ -494,44 +514,44 @@ index_html = f"""<!DOCTYPE html>
 
   .progress-hint {{
     color: #64748b;
-    font-size: 0.8rem;
+    font-size: 0.75rem;
     margin-top: 0.75rem;
   }}
 
   /* Results panel */
   .results-panel {{
-    width: 90%;
+    width: min(90%, calc(100vw - 1.5rem));
     max-width: 900px;
     background: var(--glass-bg);
     border: 1px solid var(--glass-border);
-    border-radius: 16px;
+    border-radius: clamp(10px, 2.5vw, 16px);
     backdrop-filter: blur(12px);
-    padding: 1rem 1.25rem;
-    margin-bottom: 2.5rem;
+    padding: 0.85rem 1rem;
+    margin-bottom: 2rem;
   }}
 
   .results-title {{
-    font-size: 0.75rem;
+    font-size: 0.7rem;
     font-weight: 700;
     letter-spacing: 0.1em;
     text-transform: uppercase;
     color: #64748b;
-    margin-bottom: 0.75rem;
+    margin-bottom: 0.65rem;
   }}
 
   .results-row {{
     display: flex;
     align-items: center;
-    gap: 0.75rem;
-    padding: 0.4rem 0;
+    gap: 0.5rem;
+    padding: 0.35rem 0;
     border-bottom: 1px solid rgba(255,255,255,0.04);
   }}
 
   .results-row:last-child {{ border-bottom: none; }}
 
   .rank-badge {{
-    width: 22px;
-    font-size: 0.8rem;
+    width: 20px;
+    font-size: 0.75rem;
     font-weight: 700;
     color: #64748b;
     flex-shrink: 0;
@@ -546,18 +566,30 @@ index_html = f"""<!DOCTYPE html>
     flex: 1;
     display: flex;
     align-items: center;
-    gap: 8px;
-    font-size: 0.85rem;
+    gap: 6px;
+    font-size: clamp(0.75rem, 2.5vw, 0.85rem);
     font-weight: 600;
     color: #e2e8f0;
+    min-width: 0;
+  }}
+
+  .result-name span:last-child {{
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }}
 
   .ship-bar-wrap {{
     flex: 2;
-    height: 6px;
+    height: 5px;
     background: rgba(255,255,255,0.06);
     border-radius: 9999px;
     overflow: hidden;
+    min-width: 40px;
+  }}
+
+  @media (max-width: 380px) {{
+    .ship-bar-wrap {{ display: none; }}
   }}
 
   .ship-bar {{
@@ -567,11 +599,10 @@ index_html = f"""<!DOCTYPE html>
   }}
 
   .ship-count {{
-    font-size: 0.8rem;
+    font-size: clamp(0.7rem, 2vw, 0.8rem);
     color: #94a3b8;
     white-space: nowrap;
-    min-width: 72px;
-    text-align: right;
+    flex-shrink: 0;
   }}
 </style>
 </head>
@@ -596,7 +627,7 @@ index_html = f"""<!DOCTYPE html>
 
 <div id="legend-wrapper">{legend_html(ALL_LEGEND_LABELS['ffa-archive'], 4)}</div>
 
-<div class="glass-container">
+<div class="glass-container" id="glass-container">
   <div class="loading-overlay" id="loadingOverlay">
     <div class="spinner"></div>
     <div class="loading-text" id="loadingText">Compiling JAX XLA Graphs...</div>
@@ -631,6 +662,24 @@ index_html = f"""<!DOCTYPE html>
 
   function currentKey() {{ return currentMode + '-' + currentType; }}
 
+  // Scale all iframes so the 800×800 Kaggle render fills the container
+  const IFRAME_SIZE = 800;
+  function scaleIframes() {{
+    const c = document.getElementById('glass-container');
+    const scale = Math.min(c.clientWidth / IFRAME_SIZE, c.clientHeight / IFRAME_SIZE);
+    const ox = (c.clientWidth  - IFRAME_SIZE * scale) / 2;
+    const oy = (c.clientHeight - IFRAME_SIZE * scale) / 2;
+    document.querySelectorAll('iframe').forEach(f => {{
+      f.style.transform = `scale(${{scale}})`;
+      f.style.left = ox + 'px';
+      f.style.top  = oy + 'px';
+    }});
+  }}
+
+  window.addEventListener('resize', scaleIframes);
+  // Run after layout is stable
+  requestAnimationFrame(() => requestAnimationFrame(scaleIframes));
+
   function renderStats(key) {{
     const rows = STATS[key];
     if (!rows || !rows.length) {{
@@ -647,13 +696,13 @@ index_html = f"""<!DOCTYPE html>
       return `<div class="results-row">
         <span class="rank-badge ${{rankClass}}">${{symbol}}</span>
         <span class="result-name">
-          <span class="swatch" style="background:${{r.color}};${{border}}width:10px;height:10px;border-radius:50%;flex-shrink:0;display:inline-block"></span>
-          P${{r.player + 1}} · ${{r.name}}
+          <span style="background:${{r.color}};${{border}}width:9px;height:9px;border-radius:50%;flex-shrink:0;display:inline-block"></span>
+          <span>P${{r.player + 1}} · ${{r.name}}</span>
         </span>
         <div class="ship-bar-wrap">
           <div class="ship-bar" style="width:${{pct}}%;background:${{r.color}}"></div>
         </div>
-        <span class="ship-count">${{r.total.toLocaleString()}} ships</span>
+        <span class="ship-count">${{r.total.toLocaleString()}}</span>
       </div>`;
     }}).join('');
   }}
@@ -669,6 +718,7 @@ index_html = f"""<!DOCTYPE html>
     }}
     document.getElementById('legend-wrapper').innerHTML = LEGENDS[key];
     renderStats(key);
+    scaleIframes();
 
     document.getElementById('btn-ffa').className    = 'toggle-btn' + (currentMode === 'ffa'   ? ' active' : '');
     document.getElementById('btn-duel').className   = 'toggle-btn' + (currentMode === 'duel'  ? ' active' : '');
@@ -745,7 +795,6 @@ index_html = f"""<!DOCTYPE html>
     }}
   }}
 
-  // Initial stats render
   renderStats('ffa-archive');
 </script>
 </body>
