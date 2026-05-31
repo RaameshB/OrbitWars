@@ -1,4 +1,4 @@
-import os, glob, sys, argparse, functools
+import os, glob, sys, argparse, functools, json
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import jax
@@ -24,6 +24,8 @@ HOF_SIZE = HOF_ARCHIVE_SIZE + HOF_EXPLOIT_SIZE
 
 # Wong colorblind-safe palette — must match jax_visualizer.py
 PLAYER_COLORS = ['#0072B2', '#D55E00', '#009E73', '#F0E442']
+
+CLOUDFLARE_WORKER_URL = 'https://orbit-wars-gateway.raameshb.workers.dev/'
 
 print(f"Starting {args.players}-Way HTML Site Generation...")
 
@@ -148,97 +150,603 @@ def rollout(top4_params, random_key, num_players=4):
     return history, params_env
 
 
+def compute_final_stats(states_list, num_players, player_labels):
+    """Return list of dicts sorted by final ship count (rank 1 = most ships)."""
+    final = states_list[-1]
+    results = []
+    for pid in range(num_players):
+        p_ships = int(jnp.sum(jnp.where(final.planet_owners == pid, final.planet_ships, 0)))
+        f_ships = int(jnp.sum(jnp.where(final.fleet_owners == pid, final.fleet_ships, 0)))
+        results.append({
+            'player': pid,
+            'name': player_labels[pid],
+            'color': PLAYER_COLORS[pid],
+            'planet_ships': p_ships,
+            'fleet_ships': f_ships,
+            'total': p_ships + f_ships,
+        })
+    results.sort(key=lambda x: -x['total'])
+    for rank, r in enumerate(results):
+        r['rank'] = rank + 1
+    return results
+
+
 os.makedirs("public", exist_ok=True)
 
-# --- Archive replay (top 4 agents) ---
-print("Simulating archive replay (500 steps)...")
-history, params = rollout(top4_params, dummy_key, args.players)
+has_exploit = exploit_params is not None
+
+PLAYER_LABELS = {
+    'ffa-archive':  [f'Archive #{i+1}' for i in range(args.players)],
+    'ffa-exploit':  ['Champion'] + [f'Exploiter {i+1}' for i in range(args.players - 1)],
+    'duel-archive': ['Archive #1', 'Archive #2'],
+    'duel-exploit': ['Champion', 'Exploiter'],
+}
+
+all_stats = {}
+
+# --- FFA archive replay ---
+print("Simulating FFA archive replay (500 steps)...")
+key_ffa_arch = dummy_key
+history, params = rollout(top4_params, key_ffa_arch, args.players)
 states_list = [tree_map(lambda x: x[t], history) for t in range(500)]
 env = jax_states_to_kaggle_env(states_list, params)
-print("Rendering archive HTML...")
+all_stats['ffa-archive'] = compute_final_stats(states_list, args.players, PLAYER_LABELS['ffa-archive'])
+print("Rendering FFA archive HTML...")
 with open("public/orbit_wars_replay.html", "w") as f:
     f.write(env.render(mode="html", width=800, height=800))
 print("Written: public/orbit_wars_replay.html")
 
-# --- Exploit replay (champion vs exploiters) ---
-has_exploit = exploit_params is not None
+# --- Duel archive replay ---
+print("Simulating Duel archive replay (500 steps)...")
+key_duel_arch = jax.random.PRNGKey(int(_time.time()) + 2)
+history_da, params_da = rollout(top4_params, key_duel_arch, 2)
+states_list_da = [tree_map(lambda x: x[t], history_da) for t in range(500)]
+env_da = jax_states_to_kaggle_env(states_list_da, params_da)
+all_stats['duel-archive'] = compute_final_stats(states_list_da, 2, PLAYER_LABELS['duel-archive'])
+print("Rendering Duel archive HTML...")
+with open("public/orbit_wars_replay_duel.html", "w") as f:
+    f.write(env_da.render(mode="html", width=800, height=800))
+print("Written: public/orbit_wars_replay_duel.html")
+
+# --- FFA exploit replay ---
 if has_exploit:
-    dummy_key2 = jax.random.PRNGKey(int(_time.time()) + 1)
-    print("Simulating exploit replay (500 steps)...")
-    history_ex, params_ex = rollout(exploit_params, dummy_key2, args.players)
+    key_ffa_ex = jax.random.PRNGKey(int(_time.time()) + 1)
+    print("Simulating FFA exploit replay (500 steps)...")
+    history_ex, params_ex = rollout(exploit_params, key_ffa_ex, args.players)
     states_list_ex = [tree_map(lambda x: x[t], history_ex) for t in range(500)]
     env_ex = jax_states_to_kaggle_env(states_list_ex, params_ex)
-    print("Rendering exploit HTML...")
+    all_stats['ffa-exploit'] = compute_final_stats(states_list_ex, args.players, PLAYER_LABELS['ffa-exploit'])
+    print("Rendering FFA exploit HTML...")
     with open("public/orbit_wars_replay_exploit.html", "w") as f:
         f.write(env_ex.render(mode="html", width=800, height=800))
     print("Written: public/orbit_wars_replay_exploit.html")
 
-# --- Index wrapper with toggle + legend ---
-def legend_html(labels):
+    # --- Duel exploit replay ---
+    key_duel_ex = jax.random.PRNGKey(int(_time.time()) + 3)
+    print("Simulating Duel exploit replay (500 steps)...")
+    history_de, params_de = rollout(exploit_params, key_duel_ex, 2)
+    states_list_de = [tree_map(lambda x: x[t], history_de) for t in range(500)]
+    env_de = jax_states_to_kaggle_env(states_list_de, params_de)
+    all_stats['duel-exploit'] = compute_final_stats(states_list_de, 2, PLAYER_LABELS['duel-exploit'])
+    print("Rendering Duel exploit HTML...")
+    with open("public/orbit_wars_replay_duel_exploit.html", "w") as f:
+        f.write(env_de.render(mode="html", width=800, height=800))
+    print("Written: public/orbit_wars_replay_duel_exploit.html")
+
+
+# --- Legend helpers ---
+def swatch(color, i):
+    border = 'border:1.5px solid #777;' if i == 3 else ''
+    return f'<span class="swatch" style="background:{color};{border}"></span>'
+
+
+def legend_html(labels, num):
     items = ''.join(
-        f'<div class="legend-item">'
-        f'<span class="swatch" style="background:{PLAYER_COLORS[i]};'
-        f'{"border:1px solid #777;" if i == 3 else ""}"></span>'
-        f'{label}</div>'
-        for i, label in enumerate(labels)
+        f'<div class="legend-item">{swatch(PLAYER_COLORS[i], i)}{label}</div>'
+        for i, label in enumerate(labels[:num])
     )
     return f'<div class="legend">{items}</div>'
 
-archive_labels = [f'P{i+1} · Archive #{i+1}' for i in range(args.players)]
-exploit_labels = ['P1 · Champion'] + [f'P{i+1} · Exploiter' for i in range(1, args.players)]
 
-exploit_btn_disabled = '' if has_exploit else 'disabled title="No exploiter checkpoint found"'
-exploit_btn_class = 'btn' if has_exploit else 'btn disabled'
+ALL_LEGEND_LABELS = {
+    'ffa-archive':  [f'P{i+1} · Archive #{i+1}' for i in range(args.players)],
+    'ffa-exploit':  ['P1 · Champion'] + [f'P{i+2} · Exploiter' for i in range(args.players - 1)],
+    'duel-archive': ['P1 · Archive #1', 'P2 · Archive #2'],
+    'duel-exploit': ['P1 · Champion', 'P2 · Exploiter'],
+}
+
+SRCS = {
+    'ffa-archive':  'orbit_wars_replay.html',
+    'ffa-exploit':  'orbit_wars_replay_exploit.html',
+    'duel-archive': 'orbit_wars_replay_duel.html',
+    'duel-exploit': 'orbit_wars_replay_duel_exploit.html',
+}
+
+exploit_disabled_attr = '' if has_exploit else 'disabled title="No exploiter checkpoint found"'
+
+legends_js = {
+    k: legend_html(v, 4 if k.startswith('ffa') else 2)
+    for k, v in ALL_LEGEND_LABELS.items()
+}
+
+
+def js_obj(d):
+    pairs = ', '.join(f'"{k}": `{v}`' for k, v in d.items())
+    return '{' + pairs + '}'
+
+
+srcs_js = js_obj(SRCS)
+legends_js_str = js_obj(legends_js)
+stats_js = json.dumps(all_stats)
 
 index_html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>OrbitWars Replay</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OrbitWars AI Dashboard</title>
 <style>
+  :root {{
+    --primary: #6366f1;
+    --primary-hover: #4f46e5;
+    --bg-dark: #0f172a;
+    --glass-bg: rgba(30, 41, 59, 0.7);
+    --glass-border: rgba(255, 255, 255, 0.1);
+  }}
+
   * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  body {{ background: #0e0e0e; color: #ddd; font-family: 'Courier New', monospace; height: 100vh; display: flex; flex-direction: column; }}
-  .bar {{ display: flex; align-items: center; gap: 12px; padding: 10px 16px; background: #161616; border-bottom: 1px solid #2a2a2a; flex-shrink: 0; }}
-  .btn {{ padding: 6px 14px; background: #1e1e1e; color: #aaa; border: 1px solid #333; cursor: pointer; border-radius: 3px; font-family: inherit; font-size: 13px; transition: all 0.15s; }}
-  .btn:hover:not(.disabled) {{ border-color: #555; color: #eee; }}
-  .btn.active {{ border-color: #0072B2; color: #fff; background: #0a2d4a; }}
-  .btn.disabled {{ opacity: 0.4; cursor: not-allowed; }}
-  .sep {{ color: #333; font-size: 18px; }}
-  .legend {{ display: flex; gap: 14px; align-items: center; }}
-  .legend-item {{ display: flex; align-items: center; gap: 5px; font-size: 12px; color: #bbb; white-space: nowrap; }}
-  .swatch {{ width: 11px; height: 11px; border-radius: 50%; flex-shrink: 0; }}
-  .frame-wrap {{ flex: 1; position: relative; }}
-  iframe {{ position: absolute; inset: 0; width: 100%; height: 100%; border: none; }}
+
+  body {{
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    background-color: var(--bg-dark);
+    color: white;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    background-image: radial-gradient(circle at 50% 0%, #1e1b4b 0%, var(--bg-dark) 50%);
+  }}
+
+  header {{
+    margin-top: 2.5rem;
+    margin-bottom: 1.5rem;
+    text-align: center;
+  }}
+
+  h1 {{
+    font-size: 2.5rem;
+    font-weight: 800;
+    margin: 0;
+    background: linear-gradient(to right, #818cf8, #c084fc);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    letter-spacing: -0.05em;
+  }}
+
+  p.subtitle {{
+    color: #94a3b8;
+    margin-top: 0.5rem;
+    font-size: 1rem;
+  }}
+
+  .controls {{
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+    margin-bottom: 1rem;
+    align-items: center;
+    justify-content: center;
+    z-index: 10;
+  }}
+
+  .toggle-group {{
+    display: flex;
+    background: rgba(15, 23, 42, 0.6);
+    border: 1px solid var(--glass-border);
+    border-radius: 9999px;
+    padding: 3px;
+    backdrop-filter: blur(10px);
+  }}
+
+  .toggle-btn {{
+    background: transparent;
+    border: none;
+    color: #94a3b8;
+    padding: 0.5rem 1.1rem;
+    border-radius: 9999px;
+    font-size: 0.9rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s ease-in-out;
+    white-space: nowrap;
+  }}
+
+  .toggle-btn:hover:not(:disabled) {{ color: #e2e8f0; }}
+
+  .toggle-btn.active {{
+    background: var(--glass-bg);
+    color: white;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+  }}
+
+  .toggle-btn:disabled {{ opacity: 0.35; cursor: not-allowed; }}
+
+  button.primary-btn {{
+    background: var(--primary);
+    border: none;
+    color: white;
+    padding: 0.6rem 1.4rem;
+    border-radius: 9999px;
+    font-size: 0.9rem;
+    font-weight: 600;
+    cursor: pointer;
+    backdrop-filter: blur(10px);
+    transition: all 0.2s ease-in-out;
+    box-shadow: 0 4px 6px -1px rgba(0,0,0,0.2);
+  }}
+
+  button.primary-btn:hover {{
+    background: var(--primary-hover);
+    transform: translateY(-2px);
+    box-shadow: 0 8px 15px -3px rgba(99,102,241,0.4);
+  }}
+
+  button.primary-btn:active {{ transform: translateY(0); }}
+
+  .legend {{
+    display: flex;
+    gap: 14px;
+    align-items: center;
+    margin-bottom: 0.75rem;
+    min-height: 22px;
+  }}
+
+  .legend-item {{
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.8rem;
+    color: #94a3b8;
+    white-space: nowrap;
+  }}
+
+  .swatch {{
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }}
+
+  .glass-container {{
+    width: 90%;
+    max-width: 900px;
+    height: 700px;
+    background: var(--glass-bg);
+    border: 1px solid var(--glass-border);
+    border-radius: 24px;
+    overflow: hidden;
+    backdrop-filter: blur(12px);
+    box-shadow: 0 25px 50px -12px rgba(0,0,0,0.5);
+    position: relative;
+    margin-bottom: 1.25rem;
+  }}
+
+  iframe {{
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    border: none;
+  }}
+
+  .loading-overlay {{
+    position: absolute;
+    inset: 0;
+    background: rgba(15, 23, 42, 0.88);
+    backdrop-filter: blur(8px);
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.3s ease;
+    z-index: 20;
+    border-radius: 24px;
+  }}
+
+  .loading-overlay.active {{ opacity: 1; pointer-events: all; }}
+
+  .spinner {{
+    width: 48px;
+    height: 48px;
+    border: 4px solid rgba(99, 102, 241, 0.25);
+    border-radius: 50%;
+    border-top-color: var(--primary);
+    animation: spin 1s ease-in-out infinite;
+    margin-bottom: 1.5rem;
+  }}
+
+  @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
+
+  .loading-text {{
+    font-size: 1.1rem;
+    font-weight: 600;
+    color: #e2e8f0;
+    margin-bottom: 1rem;
+  }}
+
+  .progress-bar-container {{
+    width: 55%;
+    height: 6px;
+    background: rgba(255,255,255,0.1);
+    border-radius: 9999px;
+    overflow: hidden;
+  }}
+
+  .progress-bar {{
+    height: 100%;
+    width: 0%;
+    background: linear-gradient(to right, #6366f1, #a855f7);
+    border-radius: 9999px;
+    transition: width 1s linear;
+  }}
+
+  .progress-hint {{
+    color: #64748b;
+    font-size: 0.8rem;
+    margin-top: 0.75rem;
+  }}
+
+  /* Results panel */
+  .results-panel {{
+    width: 90%;
+    max-width: 900px;
+    background: var(--glass-bg);
+    border: 1px solid var(--glass-border);
+    border-radius: 16px;
+    backdrop-filter: blur(12px);
+    padding: 1rem 1.25rem;
+    margin-bottom: 2.5rem;
+  }}
+
+  .results-title {{
+    font-size: 0.75rem;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: #64748b;
+    margin-bottom: 0.75rem;
+  }}
+
+  .results-row {{
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.4rem 0;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+  }}
+
+  .results-row:last-child {{ border-bottom: none; }}
+
+  .rank-badge {{
+    width: 22px;
+    font-size: 0.8rem;
+    font-weight: 700;
+    color: #64748b;
+    flex-shrink: 0;
+    text-align: center;
+  }}
+
+  .rank-badge.gold   {{ color: #fbbf24; }}
+  .rank-badge.silver {{ color: #94a3b8; }}
+  .rank-badge.bronze {{ color: #b45309; }}
+
+  .result-name {{
+    flex: 1;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: #e2e8f0;
+  }}
+
+  .ship-bar-wrap {{
+    flex: 2;
+    height: 6px;
+    background: rgba(255,255,255,0.06);
+    border-radius: 9999px;
+    overflow: hidden;
+  }}
+
+  .ship-bar {{
+    height: 100%;
+    border-radius: 9999px;
+    transition: width 0.4s ease;
+  }}
+
+  .ship-count {{
+    font-size: 0.8rem;
+    color: #94a3b8;
+    white-space: nowrap;
+    min-width: 72px;
+    text-align: right;
+  }}
 </style>
 </head>
 <body>
-<div class="bar">
-  <button class="btn active" id="btn-archive" onclick="switchTo('archive')">Top {args.players} Archive Agents</button>
-  <button class="{exploit_btn_class}" id="btn-exploit" onclick="switchTo('exploit')" {exploit_btn_disabled}>Champion vs Exploiters</button>
-  <span class="sep">|</span>
-  <div id="leg-archive">{legend_html(archive_labels)}</div>
-  <div id="leg-exploit" style="display:none">{legend_html(exploit_labels)}</div>
+
+<header>
+  <h1>OrbitWars AI Dashboard</h1>
+  <p class="subtitle">Live continuous monitoring of the TPU Reinforcement Learning Cluster</p>
+</header>
+
+<div class="controls">
+  <div class="toggle-group">
+    <button class="toggle-btn active" id="btn-ffa"  onclick="setMode('ffa')">FFA (4-way)</button>
+    <button class="toggle-btn"        id="btn-duel" onclick="setMode('duel')">Duel (2-way)</button>
+  </div>
+  <div class="toggle-group">
+    <button class="toggle-btn active" id="btn-archive" onclick="setType('archive')">Archive</button>
+    <button class="toggle-btn" id="btn-exploit" onclick="setType('exploit')" {exploit_disabled_attr}>Champion vs Exploiters</button>
+  </div>
+  <button class="primary-btn" onclick="triggerSimulation()">&#128640; New Game</button>
 </div>
-<div class="frame-wrap">
-  <iframe id="frame-archive" src="orbit_wars_replay.html"></iframe>
-  <iframe id="frame-exploit" src="" style="display:none"></iframe>
+
+<div id="legend-wrapper">{legend_html(ALL_LEGEND_LABELS['ffa-archive'], 4)}</div>
+
+<div class="glass-container">
+  <div class="loading-overlay" id="loadingOverlay">
+    <div class="spinner"></div>
+    <div class="loading-text" id="loadingText">Compiling JAX XLA Graphs...</div>
+    <div class="progress-bar-container">
+      <div class="progress-bar" id="progressBar"></div>
+    </div>
+    <p class="progress-hint">This process takes approximately 3 minutes.</p>
+  </div>
+  <iframe id="frame-ffa-archive"  src="orbit_wars_replay.html" style="display:block"></iframe>
+  <iframe id="frame-ffa-exploit"  src="" style="display:none"></iframe>
+  <iframe id="frame-duel-archive" src="" style="display:none"></iframe>
+  <iframe id="frame-duel-exploit" src="" style="display:none"></iframe>
 </div>
+
+<div class="results-panel" id="results-panel">
+  <div class="results-title">Final Results · 500 Steps</div>
+  <div id="results-rows"></div>
+</div>
+
 <script>
-  let exploitLoaded = false;
-  function switchTo(mode) {{
-    if (mode === 'exploit' && document.getElementById('btn-exploit').classList.contains('disabled')) return;
-    const isArchive = mode === 'archive';
-    document.getElementById('frame-archive').style.display = isArchive ? 'block' : 'none';
-    document.getElementById('frame-exploit').style.display = isArchive ? 'none' : 'block';
-    document.getElementById('leg-archive').style.display = isArchive ? 'flex' : 'none';
-    document.getElementById('leg-exploit').style.display = isArchive ? 'none' : 'flex';
-    document.getElementById('btn-archive').className = 'btn' + (isArchive ? ' active' : '');
-    document.getElementById('btn-exploit').className = '{exploit_btn_class}' + (isArchive ? '' : ' active');
-    if (!isArchive && !exploitLoaded) {{
-      document.getElementById('frame-exploit').src = 'orbit_wars_replay_exploit.html';
-      exploitLoaded = true;
+  const EXPLOIT_AVAILABLE = {'true' if has_exploit else 'false'};
+  const SRCS    = {srcs_js};
+  const LEGENDS = {legends_js_str};
+  const STATS   = {stats_js};
+
+  let currentMode = 'ffa';
+  let currentType = 'archive';
+  const loaded = {{'ffa-archive': true, 'ffa-exploit': false, 'duel-archive': false, 'duel-exploit': false}};
+
+  const RANK_CLASSES = ['gold', 'silver', 'bronze', ''];
+  const RANK_SYMBOLS = ['#1', '#2', '#3', '#4'];
+
+  function currentKey() {{ return currentMode + '-' + currentType; }}
+
+  function renderStats(key) {{
+    const rows = STATS[key];
+    if (!rows || !rows.length) {{
+      document.getElementById('results-panel').style.display = 'none';
+      return;
+    }}
+    document.getElementById('results-panel').style.display = '';
+    const maxTotal = Math.max(...rows.map(r => r.total), 1);
+    document.getElementById('results-rows').innerHTML = rows.map(r => {{
+      const pct = Math.round(r.total / maxTotal * 100);
+      const rankClass = RANK_CLASSES[r.rank - 1] || '';
+      const symbol = RANK_SYMBOLS[r.rank - 1] || '#' + r.rank;
+      const border = r.player === 3 ? 'border:1.5px solid #777;' : '';
+      return `<div class="results-row">
+        <span class="rank-badge ${{rankClass}}">${{symbol}}</span>
+        <span class="result-name">
+          <span class="swatch" style="background:${{r.color}};${{border}}width:10px;height:10px;border-radius:50%;flex-shrink:0;display:inline-block"></span>
+          P${{r.player + 1}} · ${{r.name}}
+        </span>
+        <div class="ship-bar-wrap">
+          <div class="ship-bar" style="width:${{pct}}%;background:${{r.color}}"></div>
+        </div>
+        <span class="ship-count">${{r.total.toLocaleString()}} ships</span>
+      </div>`;
+    }}).join('');
+  }}
+
+  function updateView() {{
+    const key = currentKey();
+    ['ffa-archive','ffa-exploit','duel-archive','duel-exploit'].forEach(k => {{
+      document.getElementById('frame-' + k).style.display = k === key ? 'block' : 'none';
+    }});
+    if (!loaded[key]) {{
+      document.getElementById('frame-' + key).src = SRCS[key];
+      loaded[key] = true;
+    }}
+    document.getElementById('legend-wrapper').innerHTML = LEGENDS[key];
+    renderStats(key);
+
+    document.getElementById('btn-ffa').className    = 'toggle-btn' + (currentMode === 'ffa'   ? ' active' : '');
+    document.getElementById('btn-duel').className   = 'toggle-btn' + (currentMode === 'duel'  ? ' active' : '');
+    document.getElementById('btn-archive').className = 'toggle-btn' + (currentType === 'archive' ? ' active' : '');
+    document.getElementById('btn-exploit').className = 'toggle-btn'
+      + (!EXPLOIT_AVAILABLE ? '' : currentType === 'exploit' ? ' active' : '');
+  }}
+
+  function setMode(mode) {{
+    currentMode = mode;
+    if (!EXPLOIT_AVAILABLE && currentType === 'exploit') currentType = 'archive';
+    updateView();
+  }}
+
+  function setType(type) {{
+    if (type === 'exploit' && !EXPLOIT_AVAILABLE) return;
+    currentType = type;
+    updateView();
+  }}
+
+  const CLOUDFLARE_WORKER_URL = '{CLOUDFLARE_WORKER_URL}';
+
+  async function triggerSimulation() {{
+    const overlay    = document.getElementById('loadingOverlay');
+    const progressBar = document.getElementById('progressBar');
+    const loadingText = document.getElementById('loadingText');
+
+    overlay.classList.add('active');
+    progressBar.style.width = '0%';
+    loadingText.textContent = 'Triggering simulation...';
+
+    try {{
+      const response = await fetch(CLOUDFLARE_WORKER_URL, {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{ players: 4 }})
+      }});
+
+      if (!response.ok) throw new Error('API error ' + response.status);
+
+      let progress = 0;
+      loadingText.textContent = 'Simulating 4-Way Free-For-All...';
+
+      const interval = setInterval(() => {{
+        progress += 100 / 180;
+        if (progress >= 30  && progress < 60)  loadingText.textContent = 'Downloading latest R2 checkpoints...';
+        if (progress >= 60  && progress < 90)  loadingText.textContent = 'Executing physics engine rollout...';
+        if (progress >= 90  && progress < 120) loadingText.textContent = 'Rendering interactive HTML...';
+        if (progress >= 120)                   loadingText.textContent = 'Deploying to GitHub Pages...';
+
+        if (progress >= 100) {{
+          clearInterval(interval);
+          progressBar.style.width = '100%';
+          setTimeout(() => {{
+            const ts = '?t=' + Date.now();
+            ['ffa-archive','ffa-exploit','duel-archive','duel-exploit'].forEach(k => loaded[k] = false);
+            loaded['ffa-archive'] = true;
+            document.getElementById('frame-ffa-archive').src = SRCS['ffa-archive'] + ts;
+            if (currentKey() !== 'ffa-archive') {{
+              loaded[currentKey()] = true;
+              document.getElementById('frame-' + currentKey()).src = SRCS[currentKey()] + ts;
+            }}
+            overlay.classList.remove('active');
+          }}, 5000);
+        }} else {{
+          progressBar.style.width = progress + '%';
+        }}
+      }}, 1000);
+
+    }} catch (err) {{
+      console.error(err);
+      loadingText.textContent = 'Error: Failed to connect to API Gateway.';
+      setTimeout(() => overlay.classList.remove('active'), 3000);
     }}
   }}
+
+  // Initial stats render
+  renderStats('ffa-archive');
 </script>
 </body>
 </html>"""
