@@ -170,9 +170,11 @@ def rollout(top4_params, random_key, num_players=4):
             params_b = jax.tree_util.tree_map(lambda x: x[None, ...], params_inner)
             ships_b = ships[None, ..., :60]
             intercept_angles = calculate_intercept_angle(state_b, params_b, ships_b)[0]
-            angles = jnp.concatenate([intercept_angles, ds_angles], axis=-1)
+            # intercept_angles are world-frame (computed from state.planet_coords directly)
+            # ds_angles are in the player's rotated frame and need converting to world frame
+            ds_angles_world = ds_angles + (pid * 2 * jnp.pi / num_players)
+            angles = jnp.concatenate([intercept_angles, ds_angles_world], axis=-1)
             ships = jnp.where(ships < 1.0, 0.0, ships)
-            angles = angles + (pid * 2 * jnp.pi / 4)
             is_player = (state.planet_owners == pid)[..., None]
             return jnp.where(is_player, ships, 0), jnp.where(is_player, angles, 0.0)
 
