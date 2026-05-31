@@ -9,7 +9,7 @@ from jax.sharding import SingleDeviceSharding
 from jax.tree_util import tree_map
 
 from core.networks import Actor, logits_to_action
-from core.orbit_wars_jax import setup, step, EnvAction, MAX_FLEETS
+from core.orbit_wars_jax import setup, step, EnvAction, MAX_FLEETS, MAX_COMET_PATH_LEN
 from qdax.core.containers.mapelites_repertoire import compute_cvt_centroids, MapElitesRepertoire
 from scripts.jax_visualizer import jax_states_to_kaggle_env
 
@@ -37,13 +37,13 @@ init_params = jax.tree_util.tree_map(lambda x: jnp.expand_dims(x, axis=0), init_
 if latest_ckpt:
     centroids = compute_cvt_centroids(num_descriptors=4, num_init_cvt_samples=100000, num_centroids=10000, minval=0.0, maxval=1.0, key=dummy_key)
     dummy_rep = MapElitesRepertoire.init(init_params, jnp.array([-jnp.inf]), jnp.zeros((1, 4)), centroids)
-    
+
     checkpointer = ocp.PyTreeCheckpointer()
     cpu_device = jax.local_devices(backend='cpu')[0]
     sharding = SingleDeviceSharding(cpu_device)
     sharding_tree = jax.tree_util.tree_map(lambda x: sharding, dummy_rep)
     restore_args = ocp.checkpoint_utils.construct_restore_args(dummy_rep, sharding_tree)
-    
+
     try:
         repertoire = checkpointer.restore(latest_ckpt, item=dummy_rep, restore_args=restore_args)
         # Select Top 4 Agents
@@ -73,7 +73,7 @@ def calculate_intercept_angle(state, params, ships):
     orbit_coords = jnp.stack([orbit_x, orbit_y], axis=-1)
     ages = future_steps[:, None, :] - params.comet_spawn_steps[..., None]
     comet_ages = ages[:, -20:, :]
-    safe_comet_ages = jnp.clip(comet_ages, 0, orbit_wars_jax.MAX_COMET_PATH_LEN - 1).astype(jnp.int32)
+    safe_comet_ages = jnp.clip(comet_ages, 0, MAX_COMET_PATH_LEN - 1).astype(jnp.int32)
     B_dim = safe_comet_ages.shape[0]
     b_idx = jnp.arange(B_dim)[:, None, None]
     c_idx = jnp.arange(20)[None, :, None]
@@ -177,7 +177,7 @@ def rollout(top4_params, random_key, num_players=4):
 
         ships_p0, angles_p0 = run_player(0, actor_p0)
         ships_p1, angles_p1 = run_player(1, actor_p1)
-        
+
         if num_players == 4:
             ships_p2, angles_p2 = run_player(2, actor_p2)
             ships_p3, angles_p3 = run_player(3, actor_p3)
