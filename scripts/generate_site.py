@@ -156,7 +156,7 @@ def compute_final_stats(states_list, num_players, player_labels):
     results = []
     for pid in range(num_players):
         p_ships = int(jnp.sum(jnp.where(final.planet_owners == pid, final.planet_ships, 0)))
-        f_ships = int(jnp.sum(jnp.where(final.fleet_owners == pid, final.fleet_ships, 0)))
+        f_ships = int(jnp.sum(jnp.where(final.fleet_owners == pid, final.fleet_ship_count, 0)))
         results.append({
             'player': pid,
             'name': player_labels[pid],
