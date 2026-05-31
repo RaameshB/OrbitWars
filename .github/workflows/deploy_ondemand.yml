@@ -38,7 +38,22 @@ jobs:
           source .venv/bin/activate
           uv pip install awscli
           mkdir -p /tmp/checkpoints_v6
-          aws s3 sync s3://${{ secrets.R2_BUCKET_NAME }}/v6/ /tmp/checkpoints_v6/ --endpoint-url ${{ secrets.R2_ENDPOINT_URL }}
+
+          # Find the latest uncompressed checkpoint directory (highest gen number)
+          LATEST=$(aws s3 ls s3://${{ secrets.R2_BUCKET_NAME }}/v6/ \
+            --endpoint-url ${{ secrets.R2_ENDPOINT_URL }} \
+            | awk '{print $NF}' | grep -E '^qdax_rep_[0-9]+/$' \
+            | sed 's/\///' | sort -t_ -k3 -n | tail -1)
+          echo "Latest checkpoint: $LATEST"
+
+          aws s3 sync s3://${{ secrets.R2_BUCKET_NAME }}/v6/$LATEST/ \
+            /tmp/checkpoints_v6/$LATEST/ \
+            --endpoint-url ${{ secrets.R2_ENDPOINT_URL }}
+
+          # Pull HoF if it exists (silently skip if not)
+          aws s3 sync s3://${{ secrets.R2_BUCKET_NAME }}/v6/${LATEST}_hof/ \
+            /tmp/checkpoints_v6/${LATEST}_hof/ \
+            --endpoint-url ${{ secrets.R2_ENDPOINT_URL }} 2>/dev/null || true
 
       - name: Install Python Dependencies
         run: |
