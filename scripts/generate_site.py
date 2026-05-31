@@ -771,15 +771,8 @@ index_html = f"""<!DOCTYPE html>
           clearInterval(interval);
           progressBar.style.width = '100%';
           setTimeout(() => {{
-            const ts = '?t=' + Date.now();
-            ['ffa-archive','ffa-exploit','duel-archive','duel-exploit'].forEach(k => loaded[k] = false);
-            loaded['ffa-archive'] = true;
-            document.getElementById('frame-ffa-archive').src = SRCS['ffa-archive'] + ts;
-            if (currentKey() !== 'ffa-archive') {{
-              loaded[currentKey()] = true;
-              document.getElementById('frame-' + currentKey()).src = SRCS[currentKey()] + ts;
-            }}
-            overlay.classList.remove('active');
+            // Full page reload so fresh index.html (with updated STATS) is fetched
+            window.location.href = window.location.pathname + '?t=' + Date.now();
           }}, 5000);
         }} else {{
           progressBar.style.width = progress + '%';
