@@ -726,11 +726,31 @@ def step(state: EnvState, params: EnvParams, actions: EnvAction, num_players: in
     moved_fleet_coords = new_fleet_coords + jnp.stack([dx_fleet, dy_fleet], axis=-1)
 
     # ---------------------------------------------------------
-    # [6] COLLISION DETECTION (Continuous distance, not Swept)
+    # [6] COLLISION DETECTION (Swept linear check)
     # ---------------------------------------------------------
-    # Fleet-Planet Hits (per-step distance check instead of swept quadratic)
-    dists = distance(moved_fleet_coords[:, None, :], body_coord_update[None, :, :])
-    within_radius = dists < params.planet_radii[None, :]
+    # Swept fleet A→B vs planet P0→P1: solve for t ∈ [0,1] where |A+t·dv_fleet - P0-t·dv_planet| = r.
+    # Reduces to quadratic a·t²+b·t+c=0; hit iff real roots intersect [0,1].
+    fleet_start  = new_fleet_coords[:, None, :]           # [F, 1, 2]
+    fleet_end    = moved_fleet_coords[:, None, :]          # [F, 1, 2]
+    planet_start = state.planet_coords[None, :, :]         # [1, P, 2]
+    planet_end   = body_coord_update[None, :, :]           # [1, P, 2]
+    r_sweep      = params.planet_radii[None, :]            # [1, P]
+
+    d0    = fleet_start - planet_start                     # [F, P, 2]
+    dv    = (fleet_end - fleet_start) - (planet_end - planet_start)  # relative velocity [F, P, 2]
+    a_c   = jnp.sum(dv ** 2, axis=-1)                     # [F, P]
+    b_c   = 2.0 * jnp.sum(d0 * dv, axis=-1)              # [F, P]
+    c_c   = jnp.sum(d0 ** 2, axis=-1) - r_sweep ** 2     # [F, P]
+    disc  = b_c ** 2 - 4.0 * a_c * c_c
+    sq    = jnp.sqrt(jnp.maximum(disc, 0.0))
+    denom = jnp.where(a_c > 1e-10, 2.0 * a_c, 1.0)
+    t1    = (-b_c - sq) / denom
+    t2    = (-b_c + sq) / denom
+    within_radius = jnp.where(
+        a_c > 1e-10,
+        (disc >= 0.0) & (t2 >= 0.0) & (t1 <= 1.0),
+        c_c <= 0.0,
+    )
     hit_matrix = within_radius & active_fleets[:, None] & active_bodies[None, :]
     fleet_hit_planet = jnp.any(hit_matrix, axis=1)
 
