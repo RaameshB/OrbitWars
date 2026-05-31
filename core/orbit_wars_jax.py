@@ -644,6 +644,16 @@ def step(state: EnvState, params: EnvParams, actions: EnvAction, num_players: in
         )
     )
 
+    # Keep unspawned and expired comets off-board so they don't appear as phantom
+    # neutral planets in the visualizer. clip() maps negative ages to path[0] (the
+    # on-board entry point), which would pass the visualiser's > -50 coord filter.
+    inactive_comet = params.is_comet & ((ages < 0) | (ages >= params.body_lifespans))
+    body_coord_update = jnp.where(
+        inactive_comet[:, None],
+        jnp.array([-99.0, -99.0]),
+        body_coord_update
+    )
+
     # ---------------------------------------------------------
     # [2] ACTIVE MASKING (Cleanup Expired Entities)
     # ---------------------------------------------------------

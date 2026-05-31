@@ -28,8 +28,9 @@ else:
     latest_ckpt = max(checkpoints, key=lambda x: int(x.split('_')[-1]))
     print(f'Loading Checkpoint: {latest_ckpt}')
 
-# Setup architecture
-dummy_key = jax.random.PRNGKey(0)
+# Setup architecture — use a time-based key so each deploy generates a fresh game
+import time as _time
+dummy_key = jax.random.PRNGKey(int(_time.time()))
 actor_nnx = Actor(hidden_dim=32, num_sa_layers=6, rngs=nnx.Rngs(0))
 actor_graph, init_params = nnx.split(actor_nnx)
 init_params = jax.tree_util.tree_map(lambda x: jnp.expand_dims(x, axis=0), init_params)
