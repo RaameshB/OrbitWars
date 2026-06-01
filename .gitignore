@@ -12,10 +12,11 @@ __pycache__/
 # Jupyter
 .ipynb_checkpoints/
 
-# Proprietary Training Code
+# Proprietary Training Code (lives in proprietary/ submodule)
 notebooks/
 old/
 scripts/train.py
+scripts/train_pgame.py
 scripts/train_backup_*.py
 scripts/verify_behavior.py
 
