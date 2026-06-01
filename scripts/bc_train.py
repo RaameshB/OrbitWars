@@ -42,6 +42,8 @@ args = parser.parse_args()
 
 HIDDEN_DIM    = 32
 NUM_SA_LAYERS = 6
+SHIP_SPEED    = 6.0
+MAX_FLEET_OBS = 64
 
 # ---------------------------------------------------------------------------
 # ReZero alpha logging — all scalars (ndim==0) in the params pytree are alphas;
@@ -109,6 +111,15 @@ def _log_rezero(params, label: str = ''):
         bar = '█' * int(min(abs(v) * 200, 30))
         sign = '+' if v >= 0 else '-'
         print(f"    {name:<55s} {sign}{abs(v):.5f}  {bar}")
+
+
+# ---------------------------------------------------------------------------
+# Fleet speed formula — matches orbit_wars_jax.py line 730 exactly
+# ---------------------------------------------------------------------------
+def _fleet_speed_batch(n_ships_arr):
+    n = np.maximum(np.asarray(n_ships_arr, dtype=np.float32), 1.0)
+    raw = 1.0 + (SHIP_SPEED - 1.0) * (np.log(n) / np.log(1000.0)) ** 1.5
+    return np.minimum(raw, SHIP_SPEED)
 
 
 # ---------------------------------------------------------------------------
@@ -254,13 +265,66 @@ def preprocess():
         tick_index[ep_slot].append(row['tick'])
     print(f"  {len(acts_dict):,} (episode, slot, tick) groups in {time.time()-t2:.1f}s")
 
+    # Build per-episode fleet transit event table (all players, all ticks)
+    # Each event: [launch_tick, arrival_tick, owner_slot, launch_x, launch_y, angle, n_ships]
+    print("Building fleet transit events...")
+    t_fleet = time.time()
+    all_ep_acts = (actions_df
+        .with_columns([
+            pl.col('src_planet_id').cast(pl.Int32),
+            pl.col('n_ships').cast(pl.Float32),
+            pl.col('slot').cast(pl.Int32),
+        ])
+        .group_by(['episode_id', 'tick', 'slot'])
+        .agg([pl.col('src_planet_id'), pl.col('angle'), pl.col('n_ships')]))
+
+    _ep_events = {}
+    for row in all_ep_acts.iter_rows(named=True):
+        eid, tick, fslot = row['episode_id'], row['tick'], int(row['slot'])
+        if (eid, tick) not in ps_dict:
+            continue
+        pids, owners, xs, ys, _, radii, _ = ps_dict[(eid, tick)]
+        pid_to_idx = {int(p): i for i, p in enumerate(pids)}
+        src_pids = np.asarray(row['src_planet_id'], dtype=np.int32)
+        angles_a = np.asarray(row['angle'],          dtype=np.float32)
+        nships_a = np.asarray(row['n_ships'],         dtype=np.float32)
+        src_idxs = np.fromiter((pid_to_idx.get(int(p), -1) for p in src_pids),
+                               dtype=np.int32, count=len(src_pids))
+        valid = src_idxs >= 0
+        if not valid.any():
+            continue
+        sv, av, nv = src_idxs[valid], angles_a[valid], nships_a[valid]
+        tgt_slots = _classify_batch(xs[sv], ys[sv], av, xs, ys, radii, sv)
+        hit = tgt_slots >= 0
+        if not hit.any():
+            continue
+        sv, av, nv, tv = sv[hit], av[hit], nv[hit], tgt_slots[hit]
+        dist  = np.sqrt((xs[sv]-xs[tv])**2 + (ys[sv]-ys[tv])**2) - radii[tv]
+        speed = _fleet_speed_batch(nv)
+        arr_dt = (np.ceil(np.maximum(dist, 0.0) / speed) + 2).astype(np.int32)
+        if eid not in _ep_events:
+            _ep_events[eid] = []
+        for i in range(len(sv)):
+            _ep_events[eid].append((
+                float(tick), float(tick + arr_dt[i]), float(fslot),
+                float(xs[sv[i]]), float(ys[sv[i]]), float(av[i]), float(nv[i]),
+            ))
+
+    fleet_arrays_by_ep = {eid: np.array(evs, dtype=np.float32)
+                          for eid, evs in _ep_events.items()}
+    del _ep_events
+    n_launches = sum(len(v) for v in fleet_arrays_by_ep.values())
+    print(f"  {n_launches:,} fleet launches indexed in {time.time()-t_fleet:.1f}s")
+
     # Main loop — vectorised per tick
     print("Processing ticks (vectorised)...")
     t3 = time.time()
     all_planet_obs   = []
     all_ships_target = []
     all_owner_mask   = []
-    all_returns      = []   # Monte Carlo returns for critic pretraining
+    all_returns      = []
+    all_fleet_obs    = []
+    all_fleet_mask   = []
     processed_ticks  = 0
 
     for eid, slot, n_p in top_pe.select(['episode_id', 'slot', 'n_players']).iter_rows():
@@ -341,10 +405,35 @@ def preprocess():
             # Monte Carlo return: γ^(T-t) * outcome
             ret = (args.gamma ** (max_tick - tick)) * outcome
 
+            # Fleet obs — in-transit fleets at this tick across all players
+            fleet_arr      = np.zeros((MAX_FLEET_OBS, 6), dtype=np.float32)
+            fleet_mask_arr = np.zeros(MAX_FLEET_OBS,      dtype=bool)
+            if eid in fleet_arrays_by_ep:
+                fa   = fleet_arrays_by_ep[eid]
+                in_t = fa[(fa[:, 0] <= tick) & (fa[:, 1] > tick)]
+                if len(in_t) > MAX_FLEET_OBS:
+                    in_t = in_t[:MAX_FLEET_OBS]
+                K = len(in_t)
+                if K > 0:
+                    dt    = tick - in_t[:, 0]
+                    speed = _fleet_speed_batch(in_t[:, 6])
+                    cx    = in_t[:, 3] + np.cos(in_t[:, 5]) * speed * dt
+                    cy    = in_t[:, 4] + np.sin(in_t[:, 5]) * speed * dt
+                    fdx   = cx - 50.0;  fdy = cy - 50.0
+                    fleet_arr[:K, 0] = np.arange(K, dtype=np.float32)
+                    fleet_arr[:K, 1] = np.where(in_t[:, 2] == slot, 1.0, -1.0)
+                    fleet_arr[:K, 2] = in_t[:, 5] + theta
+                    fleet_arr[:K, 3] = fdx * cos_t - fdy * sin_t + 50.0
+                    fleet_arr[:K, 4] = fdx * sin_t + fdy * cos_t + 50.0
+                    fleet_arr[:K, 5] = in_t[:, 6]
+                    fleet_mask_arr[:K] = True
+
             all_planet_obs.append(p_arr.astype(np.float16))
             all_ships_target.append(ships_target.astype(np.float16))
             all_owner_mask.append(owner_mask)
             all_returns.append(np.float32(ret))
+            all_fleet_obs.append(fleet_arr.astype(np.float16))
+            all_fleet_mask.append(fleet_mask_arr)
             processed_ticks += 1
 
             if processed_ticks % 50_000 == 0 and processed_ticks > 0:
@@ -356,6 +445,12 @@ def preprocess():
     ships_target_arr = np.stack(all_ships_target, axis=0)
     owner_mask_arr   = np.stack(all_owner_mask,   axis=0)
     returns_arr      = np.array(all_returns,      dtype=np.float32)
+    fleet_obs_arr    = np.stack(all_fleet_obs,    axis=0)
+    fleet_mask_arr   = np.stack(all_fleet_mask,   axis=0)
+
+    active_fleets = fleet_mask_arr.sum(axis=1)
+    print(f"  Fleet obs: mean={active_fleets.mean():.1f}  max={active_fleets.max()}  "
+          f"zero={( active_fleets==0).sum()} ticks with no fleets")
 
     print(f"Saving to {args.bc_data}...")
     np.savez_compressed(
@@ -364,16 +459,19 @@ def preprocess():
         ships_target=ships_target_arr,
         owner_mask=owner_mask_arr,
         returns=returns_arr,
+        fleet_obs=fleet_obs_arr,
+        fleet_mask=fleet_mask_arr,
     )
     size_mb = os.path.getsize(args.bc_data) / 1e6
     print(f"Saved {args.bc_data} ({size_mb:.1f} MB)")
-    return planet_obs_arr, ships_target_arr, owner_mask_arr, returns_arr
+    return planet_obs_arr, ships_target_arr, owner_mask_arr, returns_arr, fleet_obs_arr, fleet_mask_arr
 
 
 # ---------------------------------------------------------------------------
 # TRAIN ACTOR (BC)
 # ---------------------------------------------------------------------------
-def train(planet_obs=None, ships_target=None, owner_mask=None, returns=None):
+def train(planet_obs=None, ships_target=None, owner_mask=None, returns=None,
+          fleet_obs=None, fleet_mask=None):
     import jax
     import jax.numpy as jnp
     import optax
@@ -386,8 +484,14 @@ def train(planet_obs=None, ships_target=None, owner_mask=None, returns=None):
         planet_obs   = data['planet_obs'].astype(np.float32)
         ships_target = data['ships_target'].astype(np.float32)
         owner_mask   = data['owner_mask']
+        if 'fleet_obs' in data:
+            fleet_obs  = data['fleet_obs'].astype(np.float32)
+            fleet_mask = data['fleet_mask']
 
     N = len(planet_obs)
+    if fleet_obs is None:
+        fleet_obs  = np.zeros((N, MAX_FLEET_OBS, 6), dtype=np.float32)
+        fleet_mask = np.zeros((N, MAX_FLEET_OBS),    dtype=bool)
     rng = np.random.default_rng(42)
     perm = rng.permutation(N)
     n_val      = max(1, int(N * args.val_frac))
@@ -406,10 +510,7 @@ def train(planet_obs=None, ships_target=None, owner_mask=None, returns=None):
     opt       = optax.contrib.muon(learning_rate=schedule, weight_decay=args.weight_decay)
     opt_state = opt.init(params)
 
-    fleets_b = jnp.zeros((args.batch_size, 1, 6), dtype=jnp.float32)
-    fmask_b  = jnp.zeros((args.batch_size, 1),    dtype=bool)
-
-    def _xent(planets_b, ships_tgt_b, owner_mask_b, actor_inst):
+    def _xent(planets_b, ships_tgt_b, owner_mask_b, fleets_b, fmask_b, actor_inst):
         pmask       = planets_b[..., 5] >= 0
         logits      = actor_inst(planets_b, fleets_b, planet_mask=pmask, fleet_mask=fmask_b)
         total_sent  = ships_tgt_b.sum(axis=-1, keepdims=True)
@@ -420,16 +521,18 @@ def train(planet_obs=None, ships_target=None, owner_mask=None, returns=None):
         return jnp.sum(xent * has_action) / (jnp.sum(has_action) + 1e-8)
 
     @jax.jit
-    def train_step(params, opt_state, planets_b, ships_tgt_b, owner_mask_b):
+    def train_step(params, opt_state, planets_b, ships_tgt_b, owner_mask_b, fleets_b, fmask_b):
         def loss_fn(params):
-            return _xent(planets_b, ships_tgt_b, owner_mask_b, nnx.merge(actor_graph, params))
+            return _xent(planets_b, ships_tgt_b, owner_mask_b, fleets_b, fmask_b,
+                         nnx.merge(actor_graph, params))
         loss, grads = jax.value_and_grad(loss_fn)(params)
         updates, new_opt_state = opt.update(grads, opt_state, params)
         return optax.apply_updates(params, updates), new_opt_state, loss
 
     @jax.jit
-    def eval_step(params, planets_b, ships_tgt_b, owner_mask_b):
-        return _xent(planets_b, ships_tgt_b, owner_mask_b, nnx.merge(actor_graph, params))
+    def eval_step(params, planets_b, ships_tgt_b, owner_mask_b, fleets_b, fmask_b):
+        return _xent(planets_b, ships_tgt_b, owner_mask_b, fleets_b, fmask_b,
+                     nnx.merge(actor_graph, params))
 
     history   = []   # [{epoch, train_loss, val_loss}]
     best_val  = float('inf')
@@ -447,6 +550,8 @@ def train(planet_obs=None, ships_target=None, owner_mask=None, returns=None):
                 jnp.array(planet_obs[bi]),
                 jnp.array(ships_target[bi]),
                 jnp.array(owner_mask[bi]),
+                jnp.array(fleet_obs[bi]),
+                jnp.array(fleet_mask[bi]),
             )
             train_losses.append(float(loss))
 
@@ -462,6 +567,8 @@ def train(planet_obs=None, ships_target=None, owner_mask=None, returns=None):
                     jnp.array(planet_obs[bi]),
                     jnp.array(ships_target[bi]),
                     jnp.array(owner_mask[bi]),
+                    jnp.array(fleet_obs[bi]),
+                    jnp.array(fleet_mask[bi]),
                 )))
             val_loss = float(np.mean(val_losses))
             print(f"Epoch {epoch+1:>3d}/{args.epochs} | "
@@ -491,7 +598,7 @@ def train(planet_obs=None, ships_target=None, owner_mask=None, returns=None):
 # ---------------------------------------------------------------------------
 # PRETRAIN CRITIC  (supervised Monte Carlo returns)
 # ---------------------------------------------------------------------------
-def pretrain_critic(planet_obs=None, returns=None):
+def pretrain_critic(planet_obs=None, returns=None, fleet_obs=None, fleet_mask=None):
     import jax
     import jax.numpy as jnp
     import optax
@@ -503,8 +610,14 @@ def pretrain_critic(planet_obs=None, returns=None):
         data = np.load(args.bc_data)
         planet_obs = data['planet_obs'].astype(np.float32)
         returns    = data['returns'].astype(np.float32)
+        if 'fleet_obs' in data:
+            fleet_obs  = data['fleet_obs'].astype(np.float32)
+            fleet_mask = data['fleet_mask']
 
     N = len(planet_obs)
+    if fleet_obs is None:
+        fleet_obs  = np.zeros((N, MAX_FLEET_OBS, 6), dtype=np.float32)
+        fleet_mask = np.zeros((N, MAX_FLEET_OBS),    dtype=bool)
     rng = np.random.default_rng(43)
     perm    = rng.permutation(N)
     n_val   = max(1, int(N * args.val_frac))
@@ -524,27 +637,25 @@ def pretrain_critic(planet_obs=None, returns=None):
     opt         = optax.adamw(learning_rate=schedule, weight_decay=args.weight_decay)
     opt_state   = opt.init(params)
 
-    fleets_b  = jnp.zeros((args.batch_size, 1, 6),   dtype=jnp.float32)
-    fmask_b   = jnp.zeros((args.batch_size, 1),       dtype=bool)
-    actions_b = jnp.zeros((args.batch_size, 60, 72),  dtype=jnp.float32)
+    actions_b = jnp.zeros((args.batch_size, 60, 72), dtype=jnp.float32)
 
-    def _mse(planets_b, returns_b, critic_inst):
+    def _mse(planets_b, returns_b, fleets_b, fmask_b, critic_inst):
         pmask = planets_b[..., 5] >= 0
         q_val = critic_inst(planets_b, fleets_b, actions_b,
                             planet_mask=pmask, fleet_mask=fmask_b)
         return jnp.mean((q_val[..., 0] - returns_b) ** 2)
 
     @jax.jit
-    def train_step(params, opt_state, planets_b, returns_b):
+    def train_step(params, opt_state, planets_b, returns_b, fleets_b, fmask_b):
         def loss_fn(params):
-            return _mse(planets_b, returns_b, nnx.merge(critic_graph, params))
+            return _mse(planets_b, returns_b, fleets_b, fmask_b, nnx.merge(critic_graph, params))
         loss, grads = jax.value_and_grad(loss_fn)(params)
         updates, new_opt_state = opt.update(grads, opt_state, params)
         return optax.apply_updates(params, updates), new_opt_state, loss
 
     @jax.jit
-    def eval_step(params, planets_b, returns_b):
-        return _mse(planets_b, returns_b, nnx.merge(critic_graph, params))
+    def eval_step(params, planets_b, returns_b, fleets_b, fmask_b):
+        return _mse(planets_b, returns_b, fleets_b, fmask_b, nnx.merge(critic_graph, params))
 
     history   = []
     best_val  = float('inf')
@@ -561,6 +672,8 @@ def pretrain_critic(planet_obs=None, returns=None):
                 params, opt_state,
                 jnp.array(planet_obs[bi]),
                 jnp.array(returns[bi]),
+                jnp.array(fleet_obs[bi]),
+                jnp.array(fleet_mask[bi]),
             )
             train_losses.append(float(loss))
 
@@ -575,6 +688,8 @@ def pretrain_critic(planet_obs=None, returns=None):
                     params,
                     jnp.array(planet_obs[bi]),
                     jnp.array(returns[bi]),
+                    jnp.array(fleet_obs[bi]),
+                    jnp.array(fleet_mask[bi]),
                 )))
             val_loss = float(np.mean(val_losses))
             print(f"Epoch {epoch+1:>3d}/{args.critic_epochs} | "
@@ -622,11 +737,15 @@ if __name__ == '__main__':
     if (args.train or args.pretrain_critic) and preprocess_result is None:
         print(f"Loading {args.bc_data}...")
         _d = np.load(args.bc_data)
+        _fo = _d['fleet_obs'].astype(np.float32)  if 'fleet_obs'  in _d else None
+        _fm = _d['fleet_mask']                     if 'fleet_mask' in _d else None
         preprocess_result = (
             _d['planet_obs'].astype(np.float32),
             _d['ships_target'].astype(np.float32),
             _d['owner_mask'],
             _d['returns'].astype(np.float32),
+            _fo,
+            _fm,
         )
         print(f"  Loaded {len(preprocess_result[0]):,} samples")
 
@@ -634,4 +753,5 @@ if __name__ == '__main__':
         train(*preprocess_result)
 
     if args.pretrain_critic:
-        pretrain_critic(preprocess_result[0], preprocess_result[3])
+        pretrain_critic(preprocess_result[0], preprocess_result[3],
+                        preprocess_result[4], preprocess_result[5])
