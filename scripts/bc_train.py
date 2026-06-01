@@ -48,34 +48,62 @@ NUM_SA_LAYERS = 6
 # every other param in this architecture is at least 1-D.
 # Logs each layer by name plus a summary line.
 # ---------------------------------------------------------------------------
-def _log_rezero(params, label: str = ''):
+def _parse_rezero(params):
+    """Return list of (name, value) for all ReZero alpha scalars."""
     import jax
-
     named = []
     for path, leaf in jax.tree_util.tree_leaves_with_path(params):
         if not (hasattr(leaf, 'shape') and leaf.ndim == 0):
             continue
-        # Build a readable name from the key path
         parts = []
         for key in path:
             s = str(key)
-            # jax path keys look like "DictKey('foo')" or "SequenceKey(0)" etc.
-            # strip the wrapper to get just the value
             for wrapper in ("DictKey(key='", "DictKey('", "FlattenedIndexKey(",
                             "SequenceKey(idx=", "GetitemKey(key="):
                 if s.startswith(wrapper):
                     s = s[len(wrapper):].rstrip(")'")
                     break
             parts.append(s)
-        name = '.'.join(parts)
-        named.append((name, float(leaf)))
+        named.append(('.'.join(parts), float(leaf)))
+    return named
 
+
+def _rezero_summary(params) -> str:
+    """Compact one-line ReZero summary differentiating CA / CA-FFN / SA / SA-FFN."""
+    named = _parse_rezero(params)
+    if not named:
+        return ''
+
+    groups = {'ca': [], 'ca_ffn': [], 'sa': [], 'sa_ffn': []}
+    for name, v in named:
+        if 'cross_attention_block' in name:
+            groups['ca_ffn' if 'ffn' in name else 'ca'].append(v)
+        else:
+            groups['sa_ffn' if 'ffn' in name else 'sa'].append(v)
+
+    def fmt(vals):
+        if not vals:
+            return '—'
+        if len(vals) == 1:
+            return f'{vals[0]:+.3f}'
+        a = np.array(vals)
+        return f'{a.mean():+.3f}±{a.std():.3f}'
+
+    all_vals = np.array([v for _, v in named])
+    dead = (np.abs(all_vals) < 0.01).sum()
+    return (f"α dead={dead}/{len(named)} "
+            f"ca={fmt(groups['ca'])} ca_ffn={fmt(groups['ca_ffn'])} "
+            f"sa={fmt(groups['sa'])} sa_ffn={fmt(groups['sa_ffn'])}")
+
+
+def _log_rezero(params, label: str = ''):
+    """Full per-layer ReZero log with bar chart (used every 10 epochs)."""
+    named = _parse_rezero(params)
     if not named:
         return
-
     tag = f"[{label}] " if label else ""
     vals = np.array([v for _, v in named])
-    print(f"  {tag}ReZero α  dead={( np.abs(vals) < 0.01).sum()}/{len(vals)}  "
+    print(f"  {tag}ReZero α  dead={(np.abs(vals) < 0.01).sum()}/{len(vals)}  "
           f"mean={vals.mean():.4f}  max={vals.max():.4f}")
     for name, v in named:
         bar = '█' * int(min(abs(v) * 200, 30))
@@ -437,13 +465,13 @@ def train(planet_obs=None, ships_target=None, owner_mask=None, returns=None):
                 )))
             val_loss = float(np.mean(val_losses))
             print(f"Epoch {epoch+1:>3d}/{args.epochs} | "
-                  f"train={train_loss:.4f}  val={val_loss:.4f} | {time.time()-t0:.1f}s")
+                  f"train={train_loss:.4f}  val={val_loss:.4f} | {time.time()-t0:.1f}s  {_rezero_summary(params)}")
             history.append({'epoch': epoch + 1, 'train_loss': train_loss, 'val_loss': val_loss})
             with open(hist_path, 'w') as f:
                 json.dump({'actor': history}, f)
         else:
             val_loss = best_val  # use last known for checkpoint gating
-            print(f"Epoch {epoch+1:>3d}/{args.epochs} | train={train_loss:.4f} | {time.time()-t0:.1f}s")
+            print(f"Epoch {epoch+1:>3d}/{args.epochs} | train={train_loss:.4f} | {time.time()-t0:.1f}s  {_rezero_summary(params)}")
 
         if (epoch + 1) % 10 == 0:
             _log_rezero(params, label=f'actor epoch {epoch+1}')
@@ -550,7 +578,7 @@ def pretrain_critic(planet_obs=None, returns=None):
                 )))
             val_loss = float(np.mean(val_losses))
             print(f"Epoch {epoch+1:>3d}/{args.critic_epochs} | "
-                  f"train={train_loss:.4f}  val={val_loss:.4f} | {time.time()-t0:.1f}s")
+                  f"train={train_loss:.4f}  val={val_loss:.4f} | {time.time()-t0:.1f}s  {_rezero_summary(params)}")
             history.append({'epoch': epoch + 1, 'train_loss': train_loss, 'val_loss': val_loss})
             existing = {}
             if os.path.exists(hist_path):
@@ -561,7 +589,7 @@ def pretrain_critic(planet_obs=None, returns=None):
                 json.dump(existing, f)
         else:
             val_loss = best_val
-            print(f"Epoch {epoch+1:>3d}/{args.critic_epochs} | train={train_loss:.4f} | {time.time()-t0:.1f}s")
+            print(f"Epoch {epoch+1:>3d}/{args.critic_epochs} | train={train_loss:.4f} | {time.time()-t0:.1f}s  {_rezero_summary(params)}")
 
         if (epoch + 1) % 10 == 0:
             _log_rezero(params, label=f'critic epoch {epoch+1}')
