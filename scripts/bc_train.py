@@ -4,7 +4,8 @@ Behavioral Cloning from leaderboard replay data.
 Usage:
   uv run python scripts/bc_train.py --preprocess --data-dir /tmp/orbit-wars-parquet
   uv run python scripts/bc_train.py --train --bc-data /tmp/bc_data.npz --out weights_bc.pkl
-  uv run python scripts/bc_train.py --preprocess --train  # run both back to back
+  uv run python scripts/bc_train.py --pretrain-critic --bc-data /tmp/bc_data.npz
+  uv run python scripts/bc_train.py --preprocess --train --pretrain-critic
 """
 
 import os, sys, math, pickle, argparse, time
@@ -16,224 +17,273 @@ import numpy as np
 # Args
 # ---------------------------------------------------------------------------
 parser = argparse.ArgumentParser()
-parser.add_argument('--preprocess', action='store_true')
-parser.add_argument('--train',      action='store_true')
-parser.add_argument('--data-dir',   default='/tmp/orbit-wars-parquet')
-parser.add_argument('--bc-data',    default='/tmp/bc_data.npz')
-parser.add_argument('--out',        default='/tmp/weights_bc.pkl')
-parser.add_argument('--top-k',      type=int, default=10,   help='Top-K players by win rate')
-parser.add_argument('--min-games',  type=int, default=20)
-parser.add_argument('--epochs',     type=int, default=50)
-parser.add_argument('--batch-size', type=int, default=256)
-parser.add_argument('--lr',         type=float, default=3e-4)
+parser.add_argument('--preprocess',     action='store_true')
+parser.add_argument('--train',          action='store_true')
+parser.add_argument('--pretrain-critic',action='store_true')
+parser.add_argument('--data-dir',       default='/tmp/orbit-wars-parquet')
+parser.add_argument('--bc-data',        default='/tmp/bc_data.npz')
+parser.add_argument('--out',            default='/tmp/weights_bc.pkl')
+parser.add_argument('--critic-out',     default='/tmp/weights_bc_critic.pkl')
+parser.add_argument('--top-k',          type=int,   default=10)
+parser.add_argument('--min-games',      type=int,   default=20)
+parser.add_argument('--epochs',         type=int,   default=50)
+parser.add_argument('--critic-epochs',  type=int,   default=30)
+parser.add_argument('--batch-size',     type=int,   default=256)
+parser.add_argument('--lr',             type=float, default=3e-4)
+parser.add_argument('--weight-decay',   type=float, default=1e-2,
+                    help='AdamW weight decay (grokking-inspired; applied to 1D params via Muon)')
+parser.add_argument('--gamma',          type=float, default=0.99,
+                    help='Discount factor for Monte Carlo returns in critic pretraining')
 args = parser.parse_args()
 
 HIDDEN_DIM    = 32
 NUM_SA_LAYERS = 6
 
 # ---------------------------------------------------------------------------
-# Target classification — ray-cast angle → target planet slot
+# Vectorized ray-cast: classify all actions in a tick simultaneously
 # ---------------------------------------------------------------------------
-def classify_target(sx, sy, angle, planet_xs, planet_ys, planet_rs, src_slot):
-    """Return target slot index or -1 if deep space."""
-    cos_a, sin_a = math.cos(angle), math.sin(angle)
-    best_slot, best_t = -1, 1e18
-    for slot, (px, py, pr) in enumerate(zip(planet_xs, planet_ys, planet_rs)):
-        if slot == src_slot:
-            continue
-        dx, dy = px - sx, py - sy
-        proj = dx * cos_a + dy * sin_a
-        if proj <= 0:
-            continue
-        perp_sq = dx*dx + dy*dy - proj*proj
-        if perp_sq < pr*pr and proj < best_t:
-            best_slot, best_t = slot, proj
-    return best_slot
+def _classify_batch(src_xs, src_ys, angles, planet_xs, planet_ys, planet_rs, src_idxs):
+    """[n_acts] → [n_acts] target slot indices, -1 for deep space."""
+    cos_a = np.cos(angles)[:, None]
+    sin_a = np.sin(angles)[:, None]
+
+    dx = planet_xs[None, :] - src_xs[:, None]
+    dy = planet_ys[None, :] - src_ys[:, None]
+
+    proj    = dx * cos_a + dy * sin_a
+    perp_sq = dx*dx + dy*dy - proj*proj
+
+    n_pl      = len(planet_xs)
+    self_mask = np.arange(n_pl)[None, :] == src_idxs[:, None]
+    hits      = (proj > 0) & (perp_sq < planet_rs[None, :]**2) & ~self_mask
+
+    proj_masked = np.where(hits, proj, np.inf)
+    best = np.argmin(proj_masked, axis=1)
+    return np.where(hits.any(axis=1), best, -1)
 
 
 # ---------------------------------------------------------------------------
-# PREPROCESS
+# PREPROCESS  (Polars + vectorised numpy — no iterrows)
 # ---------------------------------------------------------------------------
 def preprocess():
-    import pandas as pd
+    import polars as pl
 
     data_dir = args.data_dir
     print(f"Loading parquet tables from {data_dir}...")
-    episodes        = pd.read_parquet(f'{data_dir}/episodes.parquet')
-    player_eps      = pd.read_parquet(f'{data_dir}/player_episodes.parquet')
-    actions_df      = pd.read_parquet(f'{data_dir}/actions.parquet')
-    ep_planets      = pd.read_parquet(f'{data_dir}/episode_planets.parquet')
-    planet_state    = pd.read_parquet(f'{data_dir}/planet_state.parquet')
-    print(f"  planet_state: {len(planet_state):,} rows")
+    t0 = time.time()
+    episodes     = pl.read_parquet(f'{data_dir}/episodes.parquet')
+    player_eps   = pl.read_parquet(f'{data_dir}/player_episodes.parquet')
+    actions_df   = pl.read_parquet(f'{data_dir}/actions.parquet')
+    ep_planets   = pl.read_parquet(f'{data_dir}/episode_planets.parquet')
+    planet_state = pl.read_parquet(f'{data_dir}/planet_state.parquet')
+    print(f"  loaded {len(planet_state):,} planet-state rows in {time.time()-t0:.1f}s")
 
     # Top-K players by win rate
-    stats = player_eps.groupby('name').agg(
-        games=('is_winner', 'count'), wins=('is_winner', 'sum')
-    ).reset_index()
-    stats['win_rate'] = stats['wins'] / stats['games']
-    top_players = (stats[stats['games'] >= args.min_games]
-                   .sort_values('win_rate', ascending=False)
-                   .head(args.top_k)['name'].tolist())
+    stats = (player_eps
+        .group_by('name')
+        .agg(games=pl.len(), wins=pl.col('is_winner').sum())
+        .with_columns(win_rate=pl.col('wins') / pl.col('games'))
+        .filter(pl.col('games') >= args.min_games)
+        .sort('win_rate', descending=True)
+        .head(args.top_k))
+    top_players = stats['name'].to_list()
     print(f"Top-{args.top_k} players: {top_players}")
 
-    # Filter player_eps to top players, join episode metadata
-    top_pe = player_eps[player_eps['name'].isin(top_players)].merge(
-        episodes[['episode_id', 'n_players', 'angular_velocity']], on='episode_id'
+    top_pe = (player_eps
+        .filter(pl.col('name').is_in(top_players))
+        .join(episodes.select(['episode_id', 'n_players', 'angular_velocity']), on='episode_id'))
+
+    eid_list     = top_pe['episode_id'].unique().to_list()
+    planet_state = planet_state.filter(pl.col('episode_id').is_in(eid_list))
+    actions_df   = actions_df.filter(pl.col('episode_id').is_in(eid_list))
+
+    # Normalize angles in bulk
+    TAU = 2 * math.pi
+    actions_df = actions_df.with_columns(
+        angle=((pl.col('angle') + math.pi) % TAU) - math.pi
     )
 
-    # Normalize angles to [-π, π]
-    def norm_angle(a):
-        return ((a + math.pi) % (2 * math.pi)) - math.pi
+    # Join planet topology into planet_state once
+    join_on = ['episode_id', 'planet_id'] if 'episode_id' in ep_planets.columns else ['planet_id']
+    ps_full = (planet_state
+        .join(ep_planets.select(join_on + ['radius', 'production']), on=join_on, how='left')
+        .with_columns([
+            pl.col('radius').fill_null(0.0).cast(pl.Float32),
+            pl.col('production').fill_null(0.0).cast(pl.Float32),
+            pl.col('x').cast(pl.Float32),
+            pl.col('y').cast(pl.Float32),
+            pl.col('ships').cast(pl.Float32),
+            pl.col('owner').cast(pl.Int32),
+            pl.col('planet_id').cast(pl.Int32),
+        ]))
 
-    # Index planet_state and ep_planets by episode for fast lookup
-    print("Indexing planet_state by episode (this may take a moment)...")
-    ps_by_ep  = {eid: grp for eid, grp in planet_state.groupby('episode_id')}
-    epp_by_ep = {eid: grp for eid, grp in ep_planets.groupby('episode_id')}
-    act_by_ep_slot = {
-        (eid, slot): grp
-        for (eid, slot), grp in actions_df.groupby(['episode_id', 'slot'])
+    # Build (episode_id, tick) → numpy arrays dict
+    print("Indexing planet state by (episode, tick)...")
+    t1 = time.time()
+    ps_grouped = (ps_full
+        .sort(['episode_id', 'tick', 'planet_id'])
+        .group_by(['episode_id', 'tick'], maintain_order=True)
+        .agg([
+            pl.col('planet_id'), pl.col('owner'),
+            pl.col('x'), pl.col('y'), pl.col('ships'),
+            pl.col('radius'), pl.col('production'),
+        ]))
+
+    ps_dict = {}
+    for row in ps_grouped.iter_rows(named=True):
+        ps_dict[(row['episode_id'], row['tick'])] = (
+            np.asarray(row['planet_id'], dtype=np.int32),
+            np.asarray(row['owner'],     dtype=np.int32),
+            np.asarray(row['x'],         dtype=np.float32),
+            np.asarray(row['y'],         dtype=np.float32),
+            np.asarray(row['ships'],     dtype=np.float32),
+            np.asarray(row['radius'],    dtype=np.float32),
+            np.asarray(row['production'],dtype=np.float32),
+        )
+    print(f"  {len(ps_dict):,} (episode, tick) groups in {time.time()-t1:.1f}s")
+
+    # Episode max tick (for computing discounted returns)
+    max_tick_by_ep = {}
+    for (eid, tick) in ps_dict:
+        if eid not in max_tick_by_ep or tick > max_tick_by_ep[eid]:
+            max_tick_by_ep[eid] = tick
+
+    # Outcome lookup: (episode_id, slot) → is_winner float
+    outcome_lookup = {
+        (row[0], row[1]): float(row[2])
+        for row in top_pe.select(['episode_id', 'slot', 'is_winner']).iter_rows()
     }
 
-    all_planet_obs  = []  # [N_ticks, 60, 7]  float16
-    all_ships_target= []  # [N_ticks, 60, 60] float16
-    all_owner_mask  = []  # [N_ticks, 60]     bool
+    # Build (episode_id, slot, tick) → action arrays dict
+    print("Indexing actions by (episode, slot, tick)...")
+    t2 = time.time()
+    acts_grouped = (actions_df
+        .with_columns([
+            pl.col('src_planet_id').cast(pl.Int32),
+            pl.col('n_ships').cast(pl.Float32),
+            pl.col('angle').cast(pl.Float32),
+            pl.col('slot').cast(pl.Int32),
+        ])
+        .group_by(['episode_id', 'slot', 'tick'])
+        .agg([pl.col('src_planet_id'), pl.col('angle'), pl.col('n_ships')]))
 
-    skipped_eps = 0
-    processed_ticks = 0
+    acts_dict  = {}
+    tick_index = {}
+    for row in acts_grouped.iter_rows(named=True):
+        key = (row['episode_id'], row['slot'], row['tick'])
+        acts_dict[key] = (
+            np.asarray(row['src_planet_id'], dtype=np.int32),
+            np.asarray(row['angle'],         dtype=np.float32),
+            np.asarray(row['n_ships'],       dtype=np.float32),
+        )
+        ep_slot = (row['episode_id'], row['slot'])
+        if ep_slot not in tick_index:
+            tick_index[ep_slot] = []
+        tick_index[ep_slot].append(row['tick'])
+    print(f"  {len(acts_dict):,} (episode, slot, tick) groups in {time.time()-t2:.1f}s")
 
-    for _, row in top_pe.iterrows():
-        eid      = row['episode_id']
-        slot     = row['slot']
-        n_p      = int(row['n_players'])
+    # Main loop — vectorised per tick
+    print("Processing ticks (vectorised)...")
+    t3 = time.time()
+    all_planet_obs   = []
+    all_ships_target = []
+    all_owner_mask   = []
+    all_returns      = []   # Monte Carlo returns for critic pretraining
+    processed_ticks  = 0
 
-        # Actions for this player in this episode
-        key = (eid, slot)
-        if key not in act_by_ep_slot:
+    for eid, slot, n_p in top_pe.select(['episode_id', 'slot', 'n_players']).iter_rows():
+        ep_slot = (eid, int(slot))
+        if ep_slot not in tick_index:
             continue
-        ep_acts = act_by_ep_slot[key]
 
-        # Planet topology for this episode
-        if eid not in epp_by_ep or eid not in ps_by_ep:
-            skipped_eps += 1
-            continue
+        theta = -slot * (2.0 * math.pi / n_p)
+        cos_t, sin_t = math.cos(theta), math.sin(theta)
 
-        topo  = epp_by_ep[eid].set_index('planet_id')  # radius, production per planet_id
-        ps_ep = ps_by_ep[eid]                           # tick-level state
+        outcome   = outcome_lookup.get(ep_slot, 0.0)
+        max_tick  = max_tick_by_ep.get(eid, 400)
 
-        # Player rotation: rotate coords to player's perspective
-        theta  = -slot * (2.0 * math.pi / n_p)
-        cos_t  = math.cos(theta)
-        sin_t  = math.sin(theta)
-
-        # Group state and actions by tick
-        ps_by_tick  = {t: g for t, g in ps_ep.groupby('tick')}
-        act_by_tick = {t: g for t, g in ep_acts.groupby('tick')}
-
-        ticks_with_actions = set(act_by_tick.keys())
-
-        for tick in ticks_with_actions:
-            if tick not in ps_by_tick:
+        for tick in tick_index[ep_slot]:
+            if (eid, tick) not in ps_dict:
                 continue
 
-            ps_tick = ps_by_tick[tick]      # planet states at this tick
-            acts    = act_by_tick[tick]     # actions this tick
-
-            # Build planet_id → slot mapping from planet_state at this tick
-            # planet_state may have fewer than 60 planets
-            pids_in_tick = ps_tick['planet_id'].values
-            n_planets = len(pids_in_tick)
-            if n_planets == 0:
+            pids, owners, xs, ys, ships_arr, radii, prods = ps_dict[(eid, tick)]
+            n_pl = len(pids)
+            if n_pl == 0:
                 continue
 
-            # planet_id → slot index (0-based in order they appear)
-            pid_to_slot = {int(pid): i for i, pid in enumerate(pids_in_tick)}
+            # Planet obs — vectorised
+            slots_arr = np.arange(n_pl)
+            dx = xs - 50.0;  dy = ys - 50.0
+            rot_x = dx * cos_t - dy * sin_t + 50.0
+            rot_y = dx * sin_t + dy * cos_t + 50.0
+            rel_owners = np.where(owners == slot, 1.0,
+                         np.where(owners < 0,    0.0, -1.0)).astype(np.float32)
 
-            # Build observation arrays — planet array [60, 7]
-            p_arr  = np.zeros((60, 7), dtype=np.float32)
-            p_mask = np.zeros(60, dtype=bool)
+            p_arr = np.zeros((60, 7), dtype=np.float32)
+            p_arr[slots_arr, 0] = slots_arr.astype(np.float32)
+            p_arr[slots_arr, 1] = rel_owners
+            p_arr[slots_arr, 2] = rot_x
+            p_arr[slots_arr, 3] = rot_y
+            p_arr[slots_arr, 4] = radii
+            p_arr[slots_arr, 5] = ships_arr
+            p_arr[slots_arr, 6] = prods
 
-            # Pre-extract arrays for classify_target
-            planet_xs = np.zeros(60, dtype=np.float32)
-            planet_ys = np.zeros(60, dtype=np.float32)
-            planet_rs = np.zeros(60, dtype=np.float32)
+            owned_mask = owners == slot
+            if not owned_mask.any():
+                continue
+            owned_slots_arr = slots_arr[owned_mask]
 
-            owned_slots = set()
+            src_pids_act, angles_act, nships_act = acts_dict[(eid, slot, tick)]
+            pid_to_idx = {int(p): i for i, p in enumerate(pids)}
+            src_idxs = np.fromiter(
+                (pid_to_idx.get(int(p), -1) for p in src_pids_act),
+                dtype=np.int32, count=len(src_pids_act)
+            )
 
-            for _, pr in ps_tick.iterrows():
-                pid   = int(pr['planet_id'])
-                pslot = pid_to_slot[pid]
-                owner = int(pr['owner'])
-                x, y  = float(pr['x']), float(pr['y'])
-                ships = float(pr['ships'])
-
-                # Topology
-                if pid not in topo.index:
-                    continue
-                radius = float(topo.loc[pid, 'radius'])
-                prod   = float(topo.loc[pid, 'production'])
-
-                # Rotate to player frame
-                dx, dy  = x - 50.0, y - 50.0
-                rot_x   = dx * cos_t - dy * sin_t + 50.0
-                rot_y   = dx * sin_t + dy * cos_t + 50.0
-
-                rel_owner = 1.0 if owner == slot else (0.0 if owner < 0 else -1.0)
-
-                p_arr[pslot]   = [pslot, rel_owner, rot_x, rot_y, radius, ships, prod]
-                p_mask[pslot]  = True
-                planet_xs[pslot] = x   # world coords for ray-cast
-                planet_ys[pslot] = y
-                planet_rs[pslot] = radius
-
-                if owner == slot:
-                    owned_slots.add(pslot)
-
-            if not owned_slots:
+            valid = (src_idxs >= 0) & np.isin(src_idxs, owned_slots_arr)
+            if not valid.any():
                 continue
 
-            # Build target ships matrix [60, 60]
+            src_v    = src_idxs[valid]
+            angles_v = angles_act[valid]
+            nships_v = nships_act[valid]
+
+            tgt_slots = _classify_batch(
+                xs[src_v], ys[src_v], angles_v,
+                xs[:n_pl], ys[:n_pl], radii[:n_pl], src_v
+            )
+
+            hit_mask = tgt_slots >= 0
+            if not hit_mask.any():
+                continue
+
             ships_target = np.zeros((60, 60), dtype=np.float32)
+            np.add.at(ships_target, (src_v[hit_mask], tgt_slots[hit_mask]), nships_v[hit_mask])
 
-            for _, act in acts.iterrows():
-                src_pid = int(act['src_planet_id'])
-                if src_pid not in pid_to_slot:
-                    continue
-                src_slot_idx = pid_to_slot[src_pid]
-                if src_slot_idx not in owned_slots:
-                    continue
-
-                angle   = norm_angle(float(act['angle']))
-                n_ships = float(act['n_ships'])
-                sx      = planet_xs[src_slot_idx]
-                sy      = planet_ys[src_slot_idx]
-
-                tgt_slot = classify_target(
-                    sx, sy, angle,
-                    planet_xs[:n_planets], planet_ys[:n_planets], planet_rs[:n_planets],
-                    src_slot_idx
-                )
-                if tgt_slot >= 0:
-                    ships_target[src_slot_idx, tgt_slot] += n_ships
-                # deep space: skip for now (angle doesn't hit any planet)
-
-            # Skip ticks where no classifiable actions
             if ships_target.sum() == 0:
                 continue
 
             owner_mask = np.zeros(60, dtype=bool)
-            for s in owned_slots:
-                owner_mask[s] = True
+            owner_mask[owned_slots_arr] = True
+
+            # Monte Carlo return: γ^(T-t) * outcome
+            ret = (args.gamma ** (max_tick - tick)) * outcome
 
             all_planet_obs.append(p_arr.astype(np.float16))
             all_ships_target.append(ships_target.astype(np.float16))
             all_owner_mask.append(owner_mask)
+            all_returns.append(np.float32(ret))
             processed_ticks += 1
 
-    print(f"\nProcessed {processed_ticks:,} ticks ({skipped_eps} episodes skipped)")
+            if processed_ticks % 50_000 == 0 and processed_ticks > 0:
+                print(f"  {processed_ticks:,} ticks | {time.time()-t3:.0f}s elapsed")
 
-    planet_obs_arr  = np.stack(all_planet_obs,   axis=0)  # [N, 60, 7]
-    ships_target_arr= np.stack(all_ships_target, axis=0)  # [N, 60, 60]
-    owner_mask_arr  = np.stack(all_owner_mask,   axis=0)  # [N, 60]
+    print(f"\nProcessed {processed_ticks:,} ticks in {time.time()-t3:.1f}s")
+
+    planet_obs_arr   = np.stack(all_planet_obs,   axis=0)
+    ships_target_arr = np.stack(all_ships_target, axis=0)
+    owner_mask_arr   = np.stack(all_owner_mask,   axis=0)
+    returns_arr      = np.array(all_returns,      dtype=np.float32)
 
     print(f"Saving to {args.bc_data}...")
     np.savez_compressed(
@@ -241,79 +291,64 @@ def preprocess():
         planet_obs=planet_obs_arr,
         ships_target=ships_target_arr,
         owner_mask=owner_mask_arr,
+        returns=returns_arr,
     )
     size_mb = os.path.getsize(args.bc_data) / 1e6
     print(f"Saved {args.bc_data} ({size_mb:.1f} MB)")
-    return planet_obs_arr, ships_target_arr, owner_mask_arr
+    return planet_obs_arr, ships_target_arr, owner_mask_arr, returns_arr
 
 
 # ---------------------------------------------------------------------------
-# TRAIN
+# TRAIN ACTOR (BC)
 # ---------------------------------------------------------------------------
-def train(planet_obs=None, ships_target=None, owner_mask=None):
+def train(planet_obs=None, ships_target=None, owner_mask=None, returns=None):
     import jax
     import jax.numpy as jnp
     import optax
     from flax import nnx
     from core.networks import Actor
 
-    # Load data if not passed directly from preprocess
     if planet_obs is None:
         print(f"Loading {args.bc_data}...")
         data = np.load(args.bc_data)
-        planet_obs   = data['planet_obs'].astype(np.float32)    # [N, 60, 7]
-        ships_target = data['ships_target'].astype(np.float32)  # [N, 60, 60]
-        owner_mask   = data['owner_mask']                        # [N, 60]
+        planet_obs   = data['planet_obs'].astype(np.float32)
+        ships_target = data['ships_target'].astype(np.float32)
+        owner_mask   = data['owner_mask']
 
     N = len(planet_obs)
-    print(f"Training on {N:,} ticks | batch={args.batch_size} | epochs={args.epochs}")
+    print(f"Training actor on {N:,} ticks | batch={args.batch_size} | epochs={args.epochs} | wd={args.weight_decay}")
 
-    # Dummy fleet input (no fleet data in parquet)
-    dummy_fleets     = np.zeros((1, 1, 6), dtype=np.float32)
-    dummy_fleet_mask = np.zeros((1, 1),    dtype=bool)
-
-    # Init network
     actor = Actor(hidden_dim=HIDDEN_DIM, num_sa_layers=NUM_SA_LAYERS, rngs=nnx.Rngs(0))
     actor_graph, params = nnx.split(actor)
 
-    # Muon optimizer with cosine LR decay
     steps_per_epoch = N // args.batch_size
     total_steps     = steps_per_epoch * args.epochs
     schedule = optax.cosine_decay_schedule(args.lr, total_steps, alpha=0.1)
-    opt      = optax.contrib.muon(learning_rate=schedule)
+    opt       = optax.contrib.muon(learning_rate=schedule, weight_decay=args.weight_decay)
     opt_state = opt.init(params)
 
-    # Tile dummy fleets to match batch size
-    fleets_b     = jnp.zeros((args.batch_size, 1, 6), dtype=jnp.float32)
-    fmask_b      = jnp.zeros((args.batch_size, 1),    dtype=bool)
+    fleets_b = jnp.zeros((args.batch_size, 1, 6), dtype=jnp.float32)
+    fmask_b  = jnp.zeros((args.batch_size, 1),    dtype=bool)
 
     @jax.jit
     def train_step(params, opt_state, planets_b, ships_tgt_b, owner_mask_b):
         def loss_fn(params):
             actor = nnx.merge(actor_graph, params)
-            # planet_mask: True for filled slots (ships > 0 or owned)
-            pmask = planets_b[..., 5] >= 0  # all valid slots
+            pmask = planets_b[..., 5] >= 0
             logits = actor(planets_b, fleets_b, planet_mask=pmask, fleet_mask=fmask_b)
-            # logits: [B, 60, 72] — first 64 are action logits (60 planets + 4 ds)
-            action_logits = logits[..., :60]  # [B, 60, 60] planet-to-planet only
+            action_logits = logits[..., :60]
 
-            # Target distribution: normalize ships sent per source planet
-            total_sent = ships_tgt_b.sum(axis=-1, keepdims=True)  # [B, 60, 1]
-            target_dist = ships_tgt_b / (total_sent + 1e-8)       # [B, 60, 60]
+            total_sent  = ships_tgt_b.sum(axis=-1, keepdims=True)
+            target_dist = ships_tgt_b / (total_sent + 1e-8)
+            log_probs   = jax.nn.log_softmax(action_logits, axis=-1)
+            xent        = -jnp.sum(target_dist * log_probs, axis=-1)
 
-            # Cross-entropy: -sum(target * log_softmax(logits)) per owned planet with actions
-            log_probs = jax.nn.log_softmax(action_logits, axis=-1)  # [B, 60, 60]
-            xent = -jnp.sum(target_dist * log_probs, axis=-1)       # [B, 60]
-
-            # Mask: only owned planets that actually sent ships this tick
-            has_action = (total_sent[..., 0] > 0) & owner_mask_b    # [B, 60]
-            loss = jnp.sum(xent * has_action) / (jnp.sum(has_action) + 1e-8)
-            return loss
+            has_action = (total_sent[..., 0] > 0) & owner_mask_b
+            return jnp.sum(xent * has_action) / (jnp.sum(has_action) + 1e-8)
 
         loss, grads = jax.value_and_grad(loss_fn)(params)
         updates, new_opt_state = opt.update(grads, opt_state, params)
-        new_params = optax.apply_updates(params, updates)
-        return new_params, new_opt_state, loss
+        return optax.apply_updates(params, updates), new_opt_state, loss
 
     rng = np.random.default_rng(42)
     best_loss = float('inf')
@@ -324,46 +359,129 @@ def train(planet_obs=None, ships_target=None, owner_mask=None):
         t0 = time.time()
 
         for start in range(0, N - args.batch_size, args.batch_size):
-            batch_idx = idx[start:start + args.batch_size]
-            planets_b  = jnp.array(planet_obs[batch_idx])    # [B, 60, 7]
-            ships_tgt_b= jnp.array(ships_target[batch_idx])  # [B, 60, 60]
-            omask_b    = jnp.array(owner_mask[batch_idx])     # [B, 60]
-
-            params, opt_state, loss = train_step(params, opt_state, planets_b, ships_tgt_b, omask_b)
+            bi = idx[start:start + args.batch_size]
+            params, opt_state, loss = train_step(
+                params, opt_state,
+                jnp.array(planet_obs[bi]),
+                jnp.array(ships_target[bi]),
+                jnp.array(owner_mask[bi]),
+            )
             epoch_losses.append(float(loss))
 
         mean_loss = np.mean(epoch_losses)
-        elapsed   = time.time() - t0
-        print(f"Epoch {epoch+1:>3d}/{args.epochs} | loss={mean_loss:.4f} | {elapsed:.1f}s")
+        print(f"Epoch {epoch+1:>3d}/{args.epochs} | loss={mean_loss:.4f} | {time.time()-t0:.1f}s")
 
         if mean_loss < best_loss:
             best_loss = mean_loss
-            # Save weights as numpy dict (same format as submission/main.py)
             final_actor = nnx.merge(actor_graph, params)
             _, best_params = nnx.split(final_actor)
             np_params = jax.tree_util.tree_map(np.array, best_params)
             with open(args.out, 'wb') as f:
                 pickle.dump(np_params, f)
 
-    print(f"\nDone. Best loss: {best_loss:.4f} | Weights saved to {args.out}")
+    print(f"\nDone. Best actor loss: {best_loss:.4f} | Saved to {args.out}")
+
+
+# ---------------------------------------------------------------------------
+# PRETRAIN CRITIC  (supervised Monte Carlo returns)
+# ---------------------------------------------------------------------------
+def pretrain_critic(planet_obs=None, returns=None):
+    import jax
+    import jax.numpy as jnp
+    import optax
+    from flax import nnx
+    from core.networks import Critic
+
+    if planet_obs is None:
+        print(f"Loading {args.bc_data}...")
+        data = np.load(args.bc_data)
+        planet_obs = data['planet_obs'].astype(np.float32)
+        returns    = data['returns'].astype(np.float32)
+
+    N = len(planet_obs)
+    print(f"Pretraining critic on {N:,} ticks | batch={args.batch_size} | epochs={args.critic_epochs}")
+    print(f"  Return stats: mean={returns.mean():.3f} std={returns.std():.3f} "
+          f"min={returns.min():.3f} max={returns.max():.3f}")
+
+    critic = Critic(hidden_dim=HIDDEN_DIM, num_sa_layers=NUM_SA_LAYERS, rngs=nnx.Rngs(1))
+    critic_graph, params = nnx.split(critic)
+
+    steps_per_epoch = N // args.batch_size
+    total_steps     = steps_per_epoch * args.critic_epochs
+    schedule  = optax.cosine_decay_schedule(args.lr, total_steps, alpha=0.1)
+    opt       = optax.adamw(learning_rate=schedule, weight_decay=args.weight_decay)
+    opt_state = opt.init(params)
+
+    # Critic takes (planets, fleets, actions) — zero actions: learns V(s) from state alone
+    fleets_b  = jnp.zeros((args.batch_size, 1, 6),  dtype=jnp.float32)
+    fmask_b   = jnp.zeros((args.batch_size, 1),     dtype=bool)
+    actions_b = jnp.zeros((args.batch_size, 60, 72),dtype=jnp.float32)
+
+    @jax.jit
+    def train_step(params, opt_state, planets_b, returns_b):
+        def loss_fn(params):
+            critic  = nnx.merge(critic_graph, params)
+            pmask   = planets_b[..., 5] >= 0
+            q_val   = critic(planets_b, fleets_b, actions_b,
+                             planet_mask=pmask, fleet_mask=fmask_b)  # [B, 1]
+            return jnp.mean((q_val[..., 0] - returns_b) ** 2)
+
+        loss, grads = jax.value_and_grad(loss_fn)(params)
+        updates, new_opt_state = opt.update(grads, opt_state, params)
+        return optax.apply_updates(params, updates), new_opt_state, loss
+
+    rng = np.random.default_rng(43)
+    best_loss = float('inf')
+
+    for epoch in range(args.critic_epochs):
+        idx = rng.permutation(N)
+        epoch_losses = []
+        t0 = time.time()
+
+        for start in range(0, N - args.batch_size, args.batch_size):
+            bi = idx[start:start + args.batch_size]
+            params, opt_state, loss = train_step(
+                params, opt_state,
+                jnp.array(planet_obs[bi]),
+                jnp.array(returns[bi]),
+            )
+            epoch_losses.append(float(loss))
+
+        mean_loss = np.mean(epoch_losses)
+        print(f"Epoch {epoch+1:>3d}/{args.critic_epochs} | mse={mean_loss:.4f} | {time.time()-t0:.1f}s")
+
+        if mean_loss < best_loss:
+            best_loss = mean_loss
+            final_critic = nnx.merge(critic_graph, params)
+            _, best_params = nnx.split(final_critic)
+            np_params = jax.tree_util.tree_map(np.array, best_params)
+            with open(args.critic_out, 'wb') as f:
+                pickle.dump(np_params, f)
+
+    print(f"\nDone. Best critic MSE: {best_loss:.4f} | Saved to {args.critic_out}")
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 if __name__ == '__main__':
-    if not args.preprocess and not args.train:
+    if not args.preprocess and not args.train and not args.pretrain_critic:
         parser.print_help()
         sys.exit(1)
 
-    data = None
+    preprocess_result = None
     if args.preprocess:
-        result = preprocess()
-        if args.train:
-            data = result  # pass directly, skip disk round-trip
+        preprocess_result = preprocess()
 
     if args.train:
-        if data:
-            train(*data)
+        if preprocess_result:
+            train(*preprocess_result)
         else:
             train()
+
+    if args.pretrain_critic:
+        if preprocess_result:
+            train(preprocess_result[0], preprocess_result[1], preprocess_result[2], preprocess_result[3])
+            pretrain_critic(preprocess_result[0], preprocess_result[3])
+        else:
+            pretrain_critic()
