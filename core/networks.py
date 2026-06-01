@@ -195,9 +195,6 @@ class Actor(nnx.Module):
         
         planetary_logits = jnp.einsum('...id,...jd->...ij', self.q_action(p_emb), self.k_action(p_emb))  # [..., 60, 60]
 
-        # Mild structural self-targeting bias; learned temperature handles global sharpness
-        planetary_logits = planetary_logits + jnp.eye(60) * 1.0
-
         # +1.0 exploration bias keeps deep space competitive against 60 planet logits
         ds_prob = self.deep_space_prob(p_emb) + 1.0  # [B, 60, 4]
 

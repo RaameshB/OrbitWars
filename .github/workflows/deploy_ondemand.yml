@@ -37,22 +37,21 @@ jobs:
           uv venv --python 3.12
           source .venv/bin/activate
           uv pip install awscli
-          mkdir -p /tmp/checkpoints_v6
+          mkdir -p /tmp/checkpoints_v7
 
-          # Find the latest uncompressed checkpoint directory (highest gen number)
-          LATEST=$(aws s3 ls s3://${{ secrets.R2_BUCKET_NAME }}/v6/ \
+          # Find the latest v7 HoF checkpoint (highest gen number)
+          LATEST_GEN=$(aws s3 ls s3://${{ secrets.R2_BUCKET_NAME }}/v7/ \
             --endpoint-url ${{ secrets.R2_ENDPOINT_URL }} \
-            | awk '{print $NF}' | grep -E '^qdax_rep_[0-9]+/$' \
-            | sed 's/\///' | sort -t_ -k3 -n | tail -1)
-          echo "Latest checkpoint: $LATEST"
+            | awk '{print $NF}' | grep -E '^hof_[0-9]+/$' \
+            | sed 's/hof_//;s/\///' | sort -n | tail -1)
+          echo "Latest v7 HoF gen: $LATEST_GEN"
 
-          aws s3 sync s3://${{ secrets.R2_BUCKET_NAME }}/v6/$LATEST/ \
-            /tmp/checkpoints_v6/$LATEST/ \
+          # Pull only the HoF weights and meta — not es_state or rngkey
+          aws s3 sync s3://${{ secrets.R2_BUCKET_NAME }}/v7/hof_${LATEST_GEN}/ \
+            /tmp/checkpoints_v7/hof_${LATEST_GEN}/ \
             --endpoint-url ${{ secrets.R2_ENDPOINT_URL }}
-
-          # Pull HoF if it exists (silently skip if not)
-          aws s3 sync s3://${{ secrets.R2_BUCKET_NAME }}/v6/${LATEST}_hof/ \
-            /tmp/checkpoints_v6/${LATEST}_hof/ \
+          aws s3 cp s3://${{ secrets.R2_BUCKET_NAME }}/v7/meta_${LATEST_GEN}.json \
+            /tmp/checkpoints_v7/meta_${LATEST_GEN}.json \
             --endpoint-url ${{ secrets.R2_ENDPOINT_URL }} 2>/dev/null || true
 
       - name: Install Python Dependencies

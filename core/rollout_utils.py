@@ -60,9 +60,8 @@ def calculate_intercept_angle(state, params, ships):
 
     tfc = future_coords[:, None, :, :, :]  # [B, 1, 60, 150, 2] broadcasts to [B, 60, 60, 150, 2]
 
-    src = state.planet_coords[:, :, None, None, :].astype(jnp.bfloat16)
-    tfc_bf16 = tfc.astype(jnp.bfloat16)
-    dists = jnp.sqrt(((tfc_bf16[..., 0] - src[..., 0])**2 + (tfc_bf16[..., 1] - src[..., 1])**2).astype(jnp.float32) + 1e-8)
+    src = state.planet_coords[:, :, None, None, :].astype(jnp.float32)
+    dists = jnp.sqrt(((tfc[..., 0] - src[..., 0])**2 + (tfc[..., 1] - src[..., 1])**2) + 1e-8)
 
     R_src = params.planet_radii[:, :, None, None]
     R_tgt = params.planet_radii[:, None, :, None]

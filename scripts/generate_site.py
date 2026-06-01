@@ -1,17 +1,15 @@
-import os, glob, sys, argparse, functools, json
+import os, glob, sys, argparse, functools, json, re
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import jax
 import jax.numpy as jnp
 from flax import nnx
 import orbax.checkpoint as ocp
-from jax.sharding import SingleDeviceSharding
 from jax.tree_util import tree_map
 
 from core.networks import Actor, logits_to_action
 from core.orbit_wars_jax import setup, step, EnvAction, MAX_FLEETS, MAX_COMET_PATH_LEN
 from core.rollout_utils import calculate_intercept_angle, build_obs_arrays
-from qdax.core.containers.mapelites_repertoire import compute_cvt_centroids, MapElitesRepertoire
 from scripts.jax_visualizer import jax_states_to_kaggle_env
 
 parser = argparse.ArgumentParser()
@@ -29,64 +27,76 @@ CLOUDFLARE_WORKER_URL = 'https://orbit-wars-gateway.raameshb.workers.dev/'
 
 print(f"Starting {args.players}-Way HTML Site Generation...")
 
-# Find latest checkpoint (exclude _hof suffix)
-checkpoints = [c for c in glob.glob('/tmp/checkpoints_v6/qdax_rep_*') if not c.endswith('_hof')]
-if not checkpoints:
-    print("Warning: No checkpoints found. Rendering untrained network.")
-    latest_ckpt = None
-else:
-    latest_ckpt = max(checkpoints, key=lambda x: int(x.split('_')[-1]))
-    print(f'Loading Checkpoint: {latest_ckpt}')
-
-# Setup architecture — use a time-based key so each deploy generates a fresh game
 import time as _time
 dummy_key = jax.random.PRNGKey(int(_time.time()))
 actor_nnx = Actor(hidden_dim=32, num_sa_layers=6, rngs=nnx.Rngs(0))
-actor_graph, init_params = nnx.split(actor_nnx)
-init_params = jax.tree_util.tree_map(lambda x: jnp.expand_dims(x, axis=0), init_params)
+actor_graph, actor_params_template = nnx.split(actor_nnx)
 
 checkpointer = ocp.PyTreeCheckpointer()
-cpu_device = jax.local_devices(backend='cpu')[0]
-sharding = SingleDeviceSharding(cpu_device)
 
-repertoire = None
-top4_params = None
-exploit_params = None  # champion vs exploiters, set if HoF available
+# HoF template: [HOF_SIZE, ...] pytree
+hof_template = jax.tree_util.tree_map(
+    lambda x: jnp.zeros((HOF_SIZE, *x.shape), dtype=x.dtype), actor_params_template
+)
 
-if latest_ckpt:
-    centroids = compute_cvt_centroids(num_descriptors=4, num_init_cvt_samples=100000, num_centroids=10000, minval=0.0, maxval=1.0, key=dummy_key)
-    dummy_rep = MapElitesRepertoire.init(init_params, jnp.array([-jnp.inf]), jnp.zeros((1, 4)), centroids)
-    sharding_tree = jax.tree_util.tree_map(lambda x: sharding, dummy_rep)
-    restore_args = ocp.checkpoint_utils.construct_restore_args(dummy_rep, sharding_tree)
+top4_params  = None
+exploit_params = None
 
+# ── Find latest v7 HoF checkpoint ────────────────────────────────────────────
+hof_dirs = glob.glob('/tmp/checkpoints_v7/hof_*')
+hof_gens = []
+for d in hof_dirs:
+    m = re.match(r'.*/hof_(\d+)$', d)
+    if m:
+        hof_gens.append((int(m.group(1)), d))
+
+if hof_gens:
+    latest_gen, latest_hof = max(hof_gens, key=lambda x: x[0])
+    print(f'Loading v7 HoF from {latest_hof} (gen {latest_gen})...')
+
+    restore_args = ocp.checkpoint_utils.construct_restore_args(hof_template)
     try:
-        repertoire = checkpointer.restore(latest_ckpt, item=dummy_rep, restore_args=restore_args)
-        top_4_indices = jnp.argsort(repertoire.fitnesses.squeeze())[-4:]
-        top4_params = jax.tree_util.tree_map(lambda x: x[top_4_indices], repertoire.genotypes)
-        print("Successfully loaded Top 4 agents!")
-    except Exception as e:
-        print(f"Failed to load checkpoint: {e}. Falling back to untrained network.")
+        hof_params = checkpointer.restore(latest_hof, item=hof_template, restore_args=restore_args)
 
-    # Try loading HoF for champion-vs-exploiter replay
-    hof_ckpt = latest_ckpt + "_hof"
-    if repertoire is not None and os.path.exists(hof_ckpt):
-        print(f"Loading HoF from {hof_ckpt}...")
-        dummy_hof = jax.tree_util.tree_map(lambda x: jnp.zeros((HOF_SIZE,) + x.shape[1:], dtype=x.dtype), init_params)
-        sharding_hof = jax.tree_util.tree_map(lambda x: sharding, dummy_hof)
-        restore_args_hof = ocp.checkpoint_utils.construct_restore_args(dummy_hof, sharding_hof)
-        try:
-            hof_loaded = checkpointer.restore(hof_ckpt, item=dummy_hof, restore_args=restore_args_hof)
-            top_idx = jnp.argmax(repertoire.fitnesses.squeeze())
-            champion = jax.tree_util.tree_map(lambda x: x[top_idx], repertoire.genotypes)
+        # Read meta to know how many agents are actually filled and where the pointer is
+        meta_path = f'/tmp/checkpoints_v7/meta_{latest_gen}.json'
+        hof_archive_ptr = HOF_ARCHIVE_SIZE
+        hof_filled      = HOF_SIZE
+        hof_exploit_ptr = HOF_EXPLOIT_SIZE
+        if os.path.exists(meta_path):
+            with open(meta_path) as f:
+                meta = json.load(f)
+            hof_archive_ptr = meta.get('hof_archive_ptr', HOF_ARCHIVE_SIZE)
+            hof_filled      = meta.get('hof_filled',      HOF_SIZE)
+            hof_exploit_ptr = meta.get('hof_exploit_ptr', HOF_EXPLOIT_SIZE)
+
+        # Pick 4 most-recently-added archive agents for the main replays
+        n_arch = min(hof_filled, HOF_ARCHIVE_SIZE)
+        arch_slots = [(hof_archive_ptr - 1 - i) % HOF_ARCHIVE_SIZE for i in range(min(4, n_arch))]
+        while len(arch_slots) < 4:
+            arch_slots.append(arch_slots[-1])  # pad with last if fewer than 4 filled
+        top4_params = jax.tree_util.tree_map(lambda x: x[jnp.array(arch_slots)], hof_params)
+        print(f'Archive replay slots: {arch_slots}')
+
+        # Exploit replay: most-recent archive agent as champion vs exploit slots
+        has_exploiters = hof_exploit_ptr > 0
+        if has_exploiters:
+            champion_slot  = arch_slots[0]
+            champion       = jax.tree_util.tree_map(lambda x: x[champion_slot], hof_params)
             num_exploiters = args.players - 1
-            exploit_indices = [HOF_ARCHIVE_SIZE + (k % HOF_EXPLOIT_SIZE) for k in range(num_exploiters)]
-            exploiters = [jax.tree_util.tree_map(lambda x, i=i: x[i], hof_loaded) for i in exploit_indices]
+            ex_slots = [HOF_ARCHIVE_SIZE + (hof_exploit_ptr - 1 - i) % HOF_EXPLOIT_SIZE
+                        for i in range(num_exploiters)]
+            exploiters = [jax.tree_util.tree_map(lambda x, i=i: x[i], hof_params) for i in ex_slots]
             exploit_params = jax.tree_util.tree_map(
                 lambda c, *es: jnp.stack([c, *es], axis=0), champion, *exploiters
             )
-            print(f"Exploit replay: champion vs exploiter slots {exploit_indices}")
-        except Exception as e:
-            print(f"Failed to load HoF ({e}). Skipping exploit replay.")
+            print(f'Exploit replay: champion slot {champion_slot} vs exploit slots {ex_slots}')
+
+        print(f'Loaded HoF (gen={latest_gen}, hof_filled={hof_filled})')
+    except Exception as e:
+        print(f'Failed to load v7 HoF: {e}. Falling back to untrained network.')
+else:
+    print('Warning: No v7 HoF checkpoints found in /tmp/checkpoints_v7/. Rendering untrained network.')
 
 if top4_params is None:
     p_keys = jax.random.split(dummy_key, 4)
@@ -142,7 +152,7 @@ def rollout(top4_params, random_key, num_players=4):
             final_angles = angles_p0 + angles_p1
         env_action = EnvAction(ships=final_ships.astype(jnp.int32), angle=final_angles)
 
-        next_state, _, _ = step(state, params_inner, env_action, num_players)
+        next_state, _, _, _ = step(state, params_inner, env_action, num_players)
         return (next_state, params_inner, key), state
 
     init_state, params_env = setup(random_key, num_players)

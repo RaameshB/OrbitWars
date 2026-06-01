@@ -697,7 +697,8 @@ def step(state: EnvState, params: EnvParams, actions: EnvAction, num_players: in
     rank_coords = flat_start_coords[sort_idx]
 
     empty_mask = state.fleet_owners == -1
-    slot_rank = jnp.cumsum(empty_mask) - 1
+    n_empty    = jnp.sum(empty_mask)
+    slot_rank  = jnp.cumsum(empty_mask) - 1
     should_fill = empty_mask & (slot_rank < n_valid)
     safe_slot_rank = jnp.clip(slot_rank, 0, MAX_MOVES_PER_STEP - 1)
 
@@ -705,6 +706,14 @@ def step(state: EnvState, params: EnvParams, actions: EnvAction, num_players: in
     new_fleet_ship_count = jnp.where(should_fill, rank_ships[safe_slot_rank], state.fleet_ship_count)
     new_fleet_angles = jnp.where(should_fill, rank_angles[safe_slot_rank], state.fleet_angles)
     new_fleet_coords = jnp.where(should_fill[:, None], rank_coords[safe_slot_rank], state.fleet_coords)
+
+    # Launches that were valid but couldn't fit in the fleet array (overflow)
+    launch_rank   = jnp.arange(MAX_MOVES_PER_STEP)
+    overflow_mask = (launch_rank < n_valid) & (launch_rank >= n_empty)
+    _pids = jnp.arange(num_players)
+    overflow_ships = jax.vmap(lambda p: jnp.sum(jnp.where(
+        (rank_owners == p) & overflow_mask, rank_ships, 0,
+    )))(_pids)
 
     # ---------------------------------------------------------
     # [4] PRODUCTION
@@ -838,4 +847,9 @@ def step(state: EnvState, params: EnvParams, actions: EnvAction, num_players: in
     fleet_score = jax.vmap(lambda p: jnp.sum(jnp.where(final_fleet_owners == p, final_fleet_ship_count, 0)))(player_ids)
     scores = planet_score + fleet_score
 
-    return new_state, scores, terminated
+    wasted_ships = jax.vmap(lambda p: jnp.sum(jnp.where(
+        (new_fleet_owners == p) & fleet_hit_sun,
+        new_fleet_ship_count, 0,
+    )))(player_ids) + overflow_ships
+
+    return new_state, scores, wasted_ships, terminated
