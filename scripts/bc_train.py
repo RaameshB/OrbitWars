@@ -40,6 +40,46 @@ HIDDEN_DIM    = 32
 NUM_SA_LAYERS = 6
 
 # ---------------------------------------------------------------------------
+# ReZero alpha logging — all scalars (ndim==0) in the params pytree are alphas;
+# every other param in this architecture is at least 1-D.
+# Logs each layer by name plus a summary line.
+# ---------------------------------------------------------------------------
+def _log_rezero(params, label: str = ''):
+    import jax
+
+    named = []
+    for path, leaf in jax.tree_util.tree_leaves_with_path(params):
+        if not (hasattr(leaf, 'shape') and leaf.ndim == 0):
+            continue
+        # Build a readable name from the key path
+        parts = []
+        for key in path:
+            s = str(key)
+            # jax path keys look like "DictKey('foo')" or "SequenceKey(0)" etc.
+            # strip the wrapper to get just the value
+            for wrapper in ("DictKey(key='", "DictKey('", "FlattenedIndexKey(",
+                            "SequenceKey(idx=", "GetitemKey(key="):
+                if s.startswith(wrapper):
+                    s = s[len(wrapper):].rstrip(")'")
+                    break
+            parts.append(s)
+        name = '.'.join(parts)
+        named.append((name, float(leaf)))
+
+    if not named:
+        return
+
+    tag = f"[{label}] " if label else ""
+    vals = np.array([v for _, v in named])
+    print(f"  {tag}ReZero α  dead={( np.abs(vals) < 0.01).sum()}/{len(vals)}  "
+          f"mean={vals.mean():.4f}  max={vals.max():.4f}")
+    for name, v in named:
+        bar = '█' * int(min(abs(v) * 200, 30))
+        sign = '+' if v >= 0 else '-'
+        print(f"    {name:<55s} {sign}{abs(v):.5f}  {bar}")
+
+
+# ---------------------------------------------------------------------------
 # Vectorized ray-cast: classify all actions in a tick simultaneously
 # ---------------------------------------------------------------------------
 def _classify_batch(src_xs, src_ys, angles, planet_xs, planet_ys, planet_rs, src_idxs):
@@ -371,6 +411,9 @@ def train(planet_obs=None, ships_target=None, owner_mask=None, returns=None):
         mean_loss = np.mean(epoch_losses)
         print(f"Epoch {epoch+1:>3d}/{args.epochs} | loss={mean_loss:.4f} | {time.time()-t0:.1f}s")
 
+        if (epoch + 1) % 10 == 0:
+            _log_rezero(params, label=f'actor epoch {epoch+1}')
+
         if mean_loss < best_loss:
             best_loss = mean_loss
             final_actor = nnx.merge(actor_graph, params)
@@ -379,6 +422,7 @@ def train(planet_obs=None, ships_target=None, owner_mask=None, returns=None):
             with open(args.out, 'wb') as f:
                 pickle.dump(np_params, f)
 
+    _log_rezero(params, label=f'actor final')
     print(f"\nDone. Best actor loss: {best_loss:.4f} | Saved to {args.out}")
 
 
@@ -450,6 +494,9 @@ def pretrain_critic(planet_obs=None, returns=None):
         mean_loss = np.mean(epoch_losses)
         print(f"Epoch {epoch+1:>3d}/{args.critic_epochs} | mse={mean_loss:.4f} | {time.time()-t0:.1f}s")
 
+        if (epoch + 1) % 10 == 0:
+            _log_rezero(params, label=f'critic epoch {epoch+1}')
+
         if mean_loss < best_loss:
             best_loss = mean_loss
             final_critic = nnx.merge(critic_graph, params)
@@ -458,6 +505,7 @@ def pretrain_critic(planet_obs=None, returns=None):
             with open(args.critic_out, 'wb') as f:
                 pickle.dump(np_params, f)
 
+    _log_rezero(params, label='critic final')
     print(f"\nDone. Best critic MSE: {best_loss:.4f} | Saved to {args.critic_out}")
 
 
