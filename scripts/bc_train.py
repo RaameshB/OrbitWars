@@ -8,7 +8,7 @@ Usage:
   uv run python scripts/bc_train.py --preprocess --train --pretrain-critic
 """
 
-import os, sys, math, pickle, argparse, time
+import os, sys, math, pickle, argparse, time, json
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
@@ -36,6 +36,8 @@ parser.add_argument('--gamma',          type=float, default=0.99,
                     help='Discount factor for Monte Carlo returns in critic pretraining')
 parser.add_argument('--val-frac',       type=float, default=0.1,
                     help='Fraction of data held out for validation loss tracking')
+parser.add_argument('--eval-every',     type=int,   default=1,
+                    help='Run val loss every N epochs (set >1 to save compute)')
 args = parser.parse_args()
 
 HIDDEN_DIM    = 32
@@ -420,23 +422,28 @@ def train(planet_obs=None, ships_target=None, owner_mask=None, returns=None):
             )
             train_losses.append(float(loss))
 
-        val_losses = []
-        for start in range(0, n_val - args.batch_size, args.batch_size):
-            bi = val_idx[start:start + args.batch_size]
-            val_losses.append(float(eval_step(
-                params,
-                jnp.array(planet_obs[bi]),
-                jnp.array(ships_target[bi]),
-                jnp.array(owner_mask[bi]),
-            )))
-
         train_loss = float(np.mean(train_losses))
-        val_loss   = float(np.mean(val_losses))
-        elapsed    = time.time() - t0
-        print(f"Epoch {epoch+1:>3d}/{args.epochs} | "
-              f"train={train_loss:.4f}  val={val_loss:.4f} | {elapsed:.1f}s")
+        do_eval    = (epoch + 1) % args.eval_every == 0 or epoch == args.epochs - 1
 
-        history.append({'epoch': epoch + 1, 'train_loss': train_loss, 'val_loss': val_loss})
+        if do_eval:
+            val_losses = []
+            for start in range(0, n_val - args.batch_size, args.batch_size):
+                bi = val_idx[start:start + args.batch_size]
+                val_losses.append(float(eval_step(
+                    params,
+                    jnp.array(planet_obs[bi]),
+                    jnp.array(ships_target[bi]),
+                    jnp.array(owner_mask[bi]),
+                )))
+            val_loss = float(np.mean(val_losses))
+            print(f"Epoch {epoch+1:>3d}/{args.epochs} | "
+                  f"train={train_loss:.4f}  val={val_loss:.4f} | {time.time()-t0:.1f}s")
+            history.append({'epoch': epoch + 1, 'train_loss': train_loss, 'val_loss': val_loss})
+            with open(hist_path, 'w') as f:
+                json.dump({'actor': history}, f)
+        else:
+            val_loss = best_val  # use last known for checkpoint gating
+            print(f"Epoch {epoch+1:>3d}/{args.epochs} | train={train_loss:.4f} | {time.time()-t0:.1f}s")
 
         if (epoch + 1) % 10 == 0:
             _log_rezero(params, label=f'actor epoch {epoch+1}')
@@ -448,10 +455,6 @@ def train(planet_obs=None, ships_target=None, owner_mask=None, returns=None):
             np_params = jax.tree_util.tree_map(np.array, best_params)
             with open(args.out, 'wb') as f:
                 pickle.dump(np_params, f)
-
-        import json
-        with open(hist_path, 'w') as f:
-            json.dump({'actor': history}, f)
 
     _log_rezero(params, label='actor final')
     print(f"\nDone. Best val loss: {best_val:.4f} | Weights → {args.out} | History → {hist_path}")
@@ -533,21 +536,32 @@ def pretrain_critic(planet_obs=None, returns=None):
             )
             train_losses.append(float(loss))
 
-        val_losses = []
-        for start in range(0, n_val - args.batch_size, args.batch_size):
-            bi = val_idx[start:start + args.batch_size]
-            val_losses.append(float(eval_step(
-                params,
-                jnp.array(planet_obs[bi]),
-                jnp.array(returns[bi]),
-            )))
-
         train_loss = float(np.mean(train_losses))
-        val_loss   = float(np.mean(val_losses))
-        print(f"Epoch {epoch+1:>3d}/{args.critic_epochs} | "
-              f"train={train_loss:.4f}  val={val_loss:.4f} | {time.time()-t0:.1f}s")
+        do_eval    = (epoch + 1) % args.eval_every == 0 or epoch == args.critic_epochs - 1
 
-        history.append({'epoch': epoch + 1, 'train_loss': train_loss, 'val_loss': val_loss})
+        if do_eval:
+            val_losses = []
+            for start in range(0, n_val - args.batch_size, args.batch_size):
+                bi = val_idx[start:start + args.batch_size]
+                val_losses.append(float(eval_step(
+                    params,
+                    jnp.array(planet_obs[bi]),
+                    jnp.array(returns[bi]),
+                )))
+            val_loss = float(np.mean(val_losses))
+            print(f"Epoch {epoch+1:>3d}/{args.critic_epochs} | "
+                  f"train={train_loss:.4f}  val={val_loss:.4f} | {time.time()-t0:.1f}s")
+            history.append({'epoch': epoch + 1, 'train_loss': train_loss, 'val_loss': val_loss})
+            existing = {}
+            if os.path.exists(hist_path):
+                with open(hist_path) as f:
+                    existing = json.load(f)
+            existing['critic'] = history
+            with open(hist_path, 'w') as f:
+                json.dump(existing, f)
+        else:
+            val_loss = best_val
+            print(f"Epoch {epoch+1:>3d}/{args.critic_epochs} | train={train_loss:.4f} | {time.time()-t0:.1f}s")
 
         if (epoch + 1) % 10 == 0:
             _log_rezero(params, label=f'critic epoch {epoch+1}')
@@ -559,16 +573,6 @@ def pretrain_critic(planet_obs=None, returns=None):
             np_params = jax.tree_util.tree_map(np.array, best_params)
             with open(args.critic_out, 'wb') as f:
                 pickle.dump(np_params, f)
-
-        import json
-        # Merge critic history into the existing JSON (actor may have written it already)
-        existing = {}
-        if os.path.exists(hist_path):
-            with open(hist_path) as f:
-                existing = json.load(f)
-        existing['critic'] = history
-        with open(hist_path, 'w') as f:
-            json.dump(existing, f)
 
     _log_rezero(params, label='critic final')
     print(f"\nDone. Best critic val MSE: {best_val:.4f} | Weights → {args.critic_out} | History → {hist_path}")
@@ -586,15 +590,20 @@ if __name__ == '__main__':
     if args.preprocess:
         preprocess_result = preprocess()
 
+    # Load data once and share between actor + critic to avoid double I/O and double JAX init
+    if (args.train or args.pretrain_critic) and preprocess_result is None:
+        print(f"Loading {args.bc_data}...")
+        _d = np.load(args.bc_data)
+        preprocess_result = (
+            _d['planet_obs'].astype(np.float32),
+            _d['ships_target'].astype(np.float32),
+            _d['owner_mask'],
+            _d['returns'].astype(np.float32),
+        )
+        print(f"  Loaded {len(preprocess_result[0]):,} samples")
+
     if args.train:
-        if preprocess_result:
-            train(*preprocess_result)
-        else:
-            train()
+        train(*preprocess_result)
 
     if args.pretrain_critic:
-        if preprocess_result:
-            train(preprocess_result[0], preprocess_result[1], preprocess_result[2], preprocess_result[3])
-            pretrain_critic(preprocess_result[0], preprocess_result[3])
-        else:
-            pretrain_critic()
+        pretrain_critic(preprocess_result[0], preprocess_result[3])
