@@ -34,6 +34,8 @@ parser.add_argument('--weight-decay',   type=float, default=1e-2,
                     help='AdamW weight decay (grokking-inspired; applied to 1D params via Muon)')
 parser.add_argument('--gamma',          type=float, default=0.99,
                     help='Discount factor for Monte Carlo returns in critic pretraining')
+parser.add_argument('--val-frac',       type=float, default=0.1,
+                    help='Fraction of data held out for validation loss tracking')
 args = parser.parse_args()
 
 HIDDEN_DIM    = 32
@@ -356,12 +358,19 @@ def train(planet_obs=None, ships_target=None, owner_mask=None, returns=None):
         owner_mask   = data['owner_mask']
 
     N = len(planet_obs)
-    print(f"Training actor on {N:,} ticks | batch={args.batch_size} | epochs={args.epochs} | wd={args.weight_decay}")
+    rng = np.random.default_rng(42)
+    perm = rng.permutation(N)
+    n_val      = max(1, int(N * args.val_frac))
+    val_idx    = perm[:n_val]
+    train_idx  = perm[n_val:]
+    N_train    = len(train_idx)
+    print(f"Training actor on {N_train:,} train / {n_val:,} val ticks | "
+          f"batch={args.batch_size} | epochs={args.epochs} | wd={args.weight_decay}")
 
     actor = Actor(hidden_dim=HIDDEN_DIM, num_sa_layers=NUM_SA_LAYERS, rngs=nnx.Rngs(0))
     actor_graph, params = nnx.split(actor)
 
-    steps_per_epoch = N // args.batch_size
+    steps_per_epoch = N_train // args.batch_size
     total_steps     = steps_per_epoch * args.epochs
     schedule = optax.cosine_decay_schedule(args.lr, total_steps, alpha=0.1)
     opt       = optax.contrib.muon(learning_rate=schedule, weight_decay=args.weight_decay)
@@ -370,60 +379,82 @@ def train(planet_obs=None, ships_target=None, owner_mask=None, returns=None):
     fleets_b = jnp.zeros((args.batch_size, 1, 6), dtype=jnp.float32)
     fmask_b  = jnp.zeros((args.batch_size, 1),    dtype=bool)
 
+    def _xent(planets_b, ships_tgt_b, owner_mask_b, actor_inst):
+        pmask       = planets_b[..., 5] >= 0
+        logits      = actor_inst(planets_b, fleets_b, planet_mask=pmask, fleet_mask=fmask_b)
+        total_sent  = ships_tgt_b.sum(axis=-1, keepdims=True)
+        target_dist = ships_tgt_b / (total_sent + 1e-8)
+        log_probs   = jax.nn.log_softmax(logits[..., :60], axis=-1)
+        xent        = -jnp.sum(target_dist * log_probs, axis=-1)
+        has_action  = (total_sent[..., 0] > 0) & owner_mask_b
+        return jnp.sum(xent * has_action) / (jnp.sum(has_action) + 1e-8)
+
     @jax.jit
     def train_step(params, opt_state, planets_b, ships_tgt_b, owner_mask_b):
         def loss_fn(params):
-            actor = nnx.merge(actor_graph, params)
-            pmask = planets_b[..., 5] >= 0
-            logits = actor(planets_b, fleets_b, planet_mask=pmask, fleet_mask=fmask_b)
-            action_logits = logits[..., :60]
-
-            total_sent  = ships_tgt_b.sum(axis=-1, keepdims=True)
-            target_dist = ships_tgt_b / (total_sent + 1e-8)
-            log_probs   = jax.nn.log_softmax(action_logits, axis=-1)
-            xent        = -jnp.sum(target_dist * log_probs, axis=-1)
-
-            has_action = (total_sent[..., 0] > 0) & owner_mask_b
-            return jnp.sum(xent * has_action) / (jnp.sum(has_action) + 1e-8)
-
+            return _xent(planets_b, ships_tgt_b, owner_mask_b, nnx.merge(actor_graph, params))
         loss, grads = jax.value_and_grad(loss_fn)(params)
         updates, new_opt_state = opt.update(grads, opt_state, params)
         return optax.apply_updates(params, updates), new_opt_state, loss
 
-    rng = np.random.default_rng(42)
-    best_loss = float('inf')
+    @jax.jit
+    def eval_step(params, planets_b, ships_tgt_b, owner_mask_b):
+        return _xent(planets_b, ships_tgt_b, owner_mask_b, nnx.merge(actor_graph, params))
+
+    history   = []   # [{epoch, train_loss, val_loss}]
+    best_val  = float('inf')
+    hist_path = args.out.replace('.pkl', '_history.json')
 
     for epoch in range(args.epochs):
-        idx = rng.permutation(N)
-        epoch_losses = []
         t0 = time.time()
+        shuffled = rng.permutation(N_train)
 
-        for start in range(0, N - args.batch_size, args.batch_size):
-            bi = idx[start:start + args.batch_size]
+        train_losses = []
+        for start in range(0, N_train - args.batch_size, args.batch_size):
+            bi = train_idx[shuffled[start:start + args.batch_size]]
             params, opt_state, loss = train_step(
                 params, opt_state,
                 jnp.array(planet_obs[bi]),
                 jnp.array(ships_target[bi]),
                 jnp.array(owner_mask[bi]),
             )
-            epoch_losses.append(float(loss))
+            train_losses.append(float(loss))
 
-        mean_loss = np.mean(epoch_losses)
-        print(f"Epoch {epoch+1:>3d}/{args.epochs} | loss={mean_loss:.4f} | {time.time()-t0:.1f}s")
+        val_losses = []
+        for start in range(0, n_val - args.batch_size, args.batch_size):
+            bi = val_idx[start:start + args.batch_size]
+            val_losses.append(float(eval_step(
+                params,
+                jnp.array(planet_obs[bi]),
+                jnp.array(ships_target[bi]),
+                jnp.array(owner_mask[bi]),
+            )))
+
+        train_loss = float(np.mean(train_losses))
+        val_loss   = float(np.mean(val_losses))
+        elapsed    = time.time() - t0
+        print(f"Epoch {epoch+1:>3d}/{args.epochs} | "
+              f"train={train_loss:.4f}  val={val_loss:.4f} | {elapsed:.1f}s")
+
+        history.append({'epoch': epoch + 1, 'train_loss': train_loss, 'val_loss': val_loss})
 
         if (epoch + 1) % 10 == 0:
             _log_rezero(params, label=f'actor epoch {epoch+1}')
 
-        if mean_loss < best_loss:
-            best_loss = mean_loss
+        if val_loss < best_val:
+            best_val = val_loss
             final_actor = nnx.merge(actor_graph, params)
             _, best_params = nnx.split(final_actor)
             np_params = jax.tree_util.tree_map(np.array, best_params)
             with open(args.out, 'wb') as f:
                 pickle.dump(np_params, f)
 
-    _log_rezero(params, label=f'actor final')
-    print(f"\nDone. Best actor loss: {best_loss:.4f} | Saved to {args.out}")
+        import json
+        with open(hist_path, 'w') as f:
+            json.dump({'actor': history}, f)
+
+    _log_rezero(params, label='actor final')
+    print(f"\nDone. Best val loss: {best_val:.4f} | Weights → {args.out} | History → {hist_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -443,70 +474,104 @@ def pretrain_critic(planet_obs=None, returns=None):
         returns    = data['returns'].astype(np.float32)
 
     N = len(planet_obs)
-    print(f"Pretraining critic on {N:,} ticks | batch={args.batch_size} | epochs={args.critic_epochs}")
-    print(f"  Return stats: mean={returns.mean():.3f} std={returns.std():.3f} "
-          f"min={returns.min():.3f} max={returns.max():.3f}")
+    rng = np.random.default_rng(43)
+    perm    = rng.permutation(N)
+    n_val   = max(1, int(N * args.val_frac))
+    val_idx = perm[:n_val]
+    tr_idx  = perm[n_val:]
+    N_train = len(tr_idx)
+    print(f"Pretraining critic on {N_train:,} train / {n_val:,} val ticks | "
+          f"batch={args.batch_size} | epochs={args.critic_epochs}")
+    print(f"  Return stats: mean={returns.mean():.3f}  std={returns.std():.3f}  "
+          f"min={returns.min():.3f}  max={returns.max():.3f}")
 
     critic = Critic(hidden_dim=HIDDEN_DIM, num_sa_layers=NUM_SA_LAYERS, rngs=nnx.Rngs(1))
     critic_graph, params = nnx.split(critic)
 
-    steps_per_epoch = N // args.batch_size
-    total_steps     = steps_per_epoch * args.critic_epochs
-    schedule  = optax.cosine_decay_schedule(args.lr, total_steps, alpha=0.1)
-    opt       = optax.adamw(learning_rate=schedule, weight_decay=args.weight_decay)
-    opt_state = opt.init(params)
+    total_steps = (N_train // args.batch_size) * args.critic_epochs
+    schedule    = optax.cosine_decay_schedule(args.lr, total_steps, alpha=0.1)
+    opt         = optax.adamw(learning_rate=schedule, weight_decay=args.weight_decay)
+    opt_state   = opt.init(params)
 
-    # Critic takes (planets, fleets, actions) — zero actions: learns V(s) from state alone
-    fleets_b  = jnp.zeros((args.batch_size, 1, 6),  dtype=jnp.float32)
-    fmask_b   = jnp.zeros((args.batch_size, 1),     dtype=bool)
-    actions_b = jnp.zeros((args.batch_size, 60, 72),dtype=jnp.float32)
+    fleets_b  = jnp.zeros((args.batch_size, 1, 6),   dtype=jnp.float32)
+    fmask_b   = jnp.zeros((args.batch_size, 1),       dtype=bool)
+    actions_b = jnp.zeros((args.batch_size, 60, 72),  dtype=jnp.float32)
+
+    def _mse(planets_b, returns_b, critic_inst):
+        pmask = planets_b[..., 5] >= 0
+        q_val = critic_inst(planets_b, fleets_b, actions_b,
+                            planet_mask=pmask, fleet_mask=fmask_b)
+        return jnp.mean((q_val[..., 0] - returns_b) ** 2)
 
     @jax.jit
     def train_step(params, opt_state, planets_b, returns_b):
         def loss_fn(params):
-            critic  = nnx.merge(critic_graph, params)
-            pmask   = planets_b[..., 5] >= 0
-            q_val   = critic(planets_b, fleets_b, actions_b,
-                             planet_mask=pmask, fleet_mask=fmask_b)  # [B, 1]
-            return jnp.mean((q_val[..., 0] - returns_b) ** 2)
-
+            return _mse(planets_b, returns_b, nnx.merge(critic_graph, params))
         loss, grads = jax.value_and_grad(loss_fn)(params)
         updates, new_opt_state = opt.update(grads, opt_state, params)
         return optax.apply_updates(params, updates), new_opt_state, loss
 
-    rng = np.random.default_rng(43)
-    best_loss = float('inf')
+    @jax.jit
+    def eval_step(params, planets_b, returns_b):
+        return _mse(planets_b, returns_b, nnx.merge(critic_graph, params))
+
+    history   = []
+    best_val  = float('inf')
+    hist_path = args.out.replace('.pkl', '_history.json')
 
     for epoch in range(args.critic_epochs):
-        idx = rng.permutation(N)
-        epoch_losses = []
         t0 = time.time()
+        shuffled = rng.permutation(N_train)
 
-        for start in range(0, N - args.batch_size, args.batch_size):
-            bi = idx[start:start + args.batch_size]
+        train_losses = []
+        for start in range(0, N_train - args.batch_size, args.batch_size):
+            bi = tr_idx[shuffled[start:start + args.batch_size]]
             params, opt_state, loss = train_step(
                 params, opt_state,
                 jnp.array(planet_obs[bi]),
                 jnp.array(returns[bi]),
             )
-            epoch_losses.append(float(loss))
+            train_losses.append(float(loss))
 
-        mean_loss = np.mean(epoch_losses)
-        print(f"Epoch {epoch+1:>3d}/{args.critic_epochs} | mse={mean_loss:.4f} | {time.time()-t0:.1f}s")
+        val_losses = []
+        for start in range(0, n_val - args.batch_size, args.batch_size):
+            bi = val_idx[start:start + args.batch_size]
+            val_losses.append(float(eval_step(
+                params,
+                jnp.array(planet_obs[bi]),
+                jnp.array(returns[bi]),
+            )))
+
+        train_loss = float(np.mean(train_losses))
+        val_loss   = float(np.mean(val_losses))
+        print(f"Epoch {epoch+1:>3d}/{args.critic_epochs} | "
+              f"train={train_loss:.4f}  val={val_loss:.4f} | {time.time()-t0:.1f}s")
+
+        history.append({'epoch': epoch + 1, 'train_loss': train_loss, 'val_loss': val_loss})
 
         if (epoch + 1) % 10 == 0:
             _log_rezero(params, label=f'critic epoch {epoch+1}')
 
-        if mean_loss < best_loss:
-            best_loss = mean_loss
+        if val_loss < best_val:
+            best_val = val_loss
             final_critic = nnx.merge(critic_graph, params)
             _, best_params = nnx.split(final_critic)
             np_params = jax.tree_util.tree_map(np.array, best_params)
             with open(args.critic_out, 'wb') as f:
                 pickle.dump(np_params, f)
 
+        import json
+        # Merge critic history into the existing JSON (actor may have written it already)
+        existing = {}
+        if os.path.exists(hist_path):
+            with open(hist_path) as f:
+                existing = json.load(f)
+        existing['critic'] = history
+        with open(hist_path, 'w') as f:
+            json.dump(existing, f)
+
     _log_rezero(params, label='critic final')
-    print(f"\nDone. Best critic MSE: {best_loss:.4f} | Saved to {args.critic_out}")
+    print(f"\nDone. Best critic val MSE: {best_val:.4f} | Weights → {args.critic_out} | History → {hist_path}")
 
 
 # ---------------------------------------------------------------------------
