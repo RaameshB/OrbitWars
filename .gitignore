@@ -28,3 +28,4 @@ public/
 # Agent notes (local planning docs)
 AGENT_NOTES.md
 .claude/settings.local.json
+data/*.npz
