@@ -581,7 +581,7 @@ def train(planet_obs=None, ships_target=None, owner_mask=None, returns=None,
         boundaries=[warmup_steps],
     )
     # α (ReZero residual weights) get a fixed low LR — they cannot tolerate large LR swings
-    main_opt  = optax.lamb(learning_rate=main_schedule, weight_decay=args.weight_decay)
+    main_opt  = optax.contrib.muon(learning_rate=main_schedule, weight_decay=args.weight_decay)
     alpha_opt = optax.adam(learning_rate=alpha_lr)
 
     def _param_labels(p):
