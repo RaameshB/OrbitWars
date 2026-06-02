@@ -45,9 +45,8 @@ parser.add_argument('--min-games',      type=int,   default=20)
 parser.add_argument('--epochs',         type=int,   default=50)
 parser.add_argument('--critic-epochs',  type=int,   default=30)
 parser.add_argument('--batch-size',     type=int,   default=512)
-parser.add_argument('--lr',             type=float, default=3e-3)
-parser.add_argument('--weight-decay',   type=float, default=1e-2,
-                    help='AdamW weight decay (grokking-inspired; applied to 1D params via Muon)')
+parser.add_argument('--lr',             type=float, default=1e-2)
+parser.add_argument('--weight-decay',   type=float, default=1e-2)
 parser.add_argument('--gamma',          type=float, default=0.99,
                     help='Discount factor for Monte Carlo returns in critic pretraining')
 parser.add_argument('--val-frac',       type=float, default=0.1,
@@ -580,7 +579,7 @@ def train(planet_obs=None, ships_target=None, owner_mask=None, returns=None,
         boundaries=[warmup_steps],
     )
     # α (ReZero residual weights) get a fixed low LR — they cannot tolerate large LR swings
-    main_opt  = optax.contrib.muon(learning_rate=main_schedule, weight_decay=args.weight_decay)
+    main_opt  = optax.adan(learning_rate=main_schedule, weight_decay=args.weight_decay)
     alpha_opt = optax.adam(learning_rate=alpha_lr)
 
     def _param_labels(p):
