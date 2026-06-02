@@ -8,8 +8,24 @@ Usage:
   uv run python scripts/bc_train.py --preprocess --train --pretrain-critic
 """
 
-import os, sys, math, pickle, argparse, time, json
+import os, sys, math, pickle, argparse, time, json, subprocess
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+try:
+    from tqdm import tqdm as _tqdm
+except ImportError:
+    _tqdm = None
+
+def _bar(iterable, **kwargs):
+    if _tqdm is not None:
+        return _tqdm(iterable, dynamic_ncols=True, leave=False, unit='batch', **kwargs)
+    return iterable
 
 import numpy as np
 
@@ -36,6 +52,12 @@ parser.add_argument('--gamma',          type=float, default=0.99,
                     help='Discount factor for Monte Carlo returns in critic pretraining')
 parser.add_argument('--val-frac',       type=float, default=0.1,
                     help='Fraction of data held out for validation loss tracking')
+parser.add_argument('--warmup-epochs',  type=int,   default=5,
+                    help='Linear LR warmup from lr/10 to lr over this many epochs')
+parser.add_argument('--resume',         action='store_true',
+                    help='Resume from local checkpoint saved alongside --out')
+parser.add_argument('--checkpoint-every',type=int,   default=30,
+                    help='Upload BC weights to R2 every N epochs (0 = disabled)')
 parser.add_argument('--eval-every',     type=int,   default=1,
                     help='Run val loss every N epochs (set >1 to save compute)')
 args = parser.parse_args()
@@ -92,7 +114,8 @@ def _rezero_summary(params) -> str:
         return f'{a.mean():+.3f}±{a.std():.3f}'
 
     all_vals = np.array([v for _, v in named])
-    dead = (np.abs(all_vals) < 0.01).sum()
+    threshold = 0.1 * np.abs(all_vals).max() if np.abs(all_vals).max() > 0 else 0.01
+    dead = (np.abs(all_vals) < threshold).sum()
     return (f"α dead={dead}/{len(named)} "
             f"ca={fmt(groups['ca'])} ca_ffn={fmt(groups['ca_ffn'])} "
             f"sa={fmt(groups['sa'])} sa_ffn={fmt(groups['sa_ffn'])}")
@@ -105,12 +128,41 @@ def _log_rezero(params, label: str = ''):
         return
     tag = f"[{label}] " if label else ""
     vals = np.array([v for _, v in named])
-    print(f"  {tag}ReZero α  dead={(np.abs(vals) < 0.01).sum()}/{len(vals)}  "
+    threshold = 0.1 * np.abs(vals).max() if np.abs(vals).max() > 0 else 0.01
+    dead = (np.abs(vals) < threshold).sum()
+    print(f"  {tag}ReZero α  dead={dead}/{len(vals)}  "
           f"mean={vals.mean():.4f}  max={vals.max():.4f}")
     for name, v in named:
         bar = '█' * int(min(abs(v) * 200, 30))
         sign = '+' if v >= 0 else '-'
         print(f"    {name:<55s} {sign}{abs(v):.5f}  {bar}")
+
+
+def _upload_to_r2(*local_paths, prefix='bc'):
+    """Upload files to R2 under the given prefix. Silently skips if creds missing."""
+    endpoint = os.environ.get('R2_ENDPOINT_URL', '')
+    bucket   = os.environ.get('R2_BUCKET_NAME', '')
+    if not endpoint or not bucket:
+        print('  [R2] skipping upload — R2_ENDPOINT_URL / R2_BUCKET_NAME not set')
+        return
+    aws_env = {
+        **os.environ,
+        'AWS_ACCESS_KEY_ID':     os.environ.get('R2_ACCESS_KEY_ID', ''),
+        'AWS_SECRET_ACCESS_KEY': os.environ.get('R2_SECRET_ACCESS_KEY', ''),
+        'AWS_DEFAULT_REGION':    'auto',
+    }
+    for path in local_paths:
+        if not os.path.exists(path):
+            continue
+        key = f's3://{bucket}/{prefix}/{os.path.basename(path)}'
+        result = subprocess.run(
+            ['aws', 's3', 'cp', path, key, '--endpoint-url', endpoint],
+            capture_output=True, text=True, env=aws_env
+        )
+        if result.returncode == 0:
+            print(f'  [R2] uploaded {os.path.basename(path)} → {key}')
+        else:
+            print(f'  [R2] upload failed for {path}: {result.stderr.strip()}')
 
 
 # ---------------------------------------------------------------------------
@@ -505,10 +557,32 @@ def train(planet_obs=None, ships_target=None, owner_mask=None, returns=None,
     actor_graph, params = nnx.split(actor)
 
     steps_per_epoch = N_train // args.batch_size
-    total_steps     = steps_per_epoch * args.epochs
-    schedule = optax.cosine_decay_schedule(args.lr, total_steps, alpha=0.1)
+    warmup_steps    = args.warmup_epochs * steps_per_epoch
+    schedule = optax.join_schedules(
+        schedules=[
+            optax.linear_schedule(args.lr * 0.1, args.lr, warmup_steps),
+            optax.constant_schedule(args.lr),
+        ],
+        boundaries=[warmup_steps],
+    )
     opt       = optax.contrib.muon(learning_rate=schedule, weight_decay=args.weight_decay)
     opt_state = opt.init(params)
+
+    resume_path = args.out.replace('.pkl', '_resume.pkl')
+    start_epoch = 0
+    history     = []
+    best_val    = float('inf')
+    hist_path   = args.out.replace('.pkl', '_history.json')
+
+    if args.resume and os.path.exists(resume_path):
+        print(f"Resuming from {resume_path}...")
+        ckpt = pickle.load(open(resume_path, 'rb'))
+        start_epoch = ckpt['epoch']
+        best_val    = ckpt['best_val']
+        history     = ckpt['history']
+        params      = jax.tree_util.tree_map(jnp.array, ckpt['params'])
+        opt_state   = jax.tree_util.tree_map(jnp.array, ckpt['opt_state'])
+        print(f"  Resumed at epoch {start_epoch} | best_val={best_val:.4f}")
 
     def _xent(planets_b, ships_tgt_b, owner_mask_b, fleets_b, fmask_b, actor_inst):
         pmask       = planets_b[..., 5] >= 0
@@ -534,16 +608,14 @@ def train(planet_obs=None, ships_target=None, owner_mask=None, returns=None,
         return _xent(planets_b, ships_tgt_b, owner_mask_b, fleets_b, fmask_b,
                      nnx.merge(actor_graph, params))
 
-    history   = []   # [{epoch, train_loss, val_loss}]
-    best_val  = float('inf')
-    hist_path = args.out.replace('.pkl', '_history.json')
-
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         t0 = time.time()
         shuffled = rng.permutation(N_train)
 
         train_losses = []
-        for start in range(0, N_train - args.batch_size, args.batch_size):
+        batch_iter = _bar(range(0, N_train - args.batch_size, args.batch_size),
+                          desc=f'E{epoch+1}/{args.epochs}')
+        for start in batch_iter:
             bi = train_idx[shuffled[start:start + args.batch_size]]
             params, opt_state, loss = train_step(
                 params, opt_state,
@@ -553,7 +625,10 @@ def train(planet_obs=None, ships_target=None, owner_mask=None, returns=None,
                 jnp.array(fleet_obs[bi]),
                 jnp.array(fleet_mask[bi]),
             )
-            train_losses.append(float(loss))
+            loss_val = float(loss)
+            train_losses.append(loss_val)
+            if _tqdm is not None:
+                batch_iter.set_postfix(loss=f'{loss_val:.4f}')
 
         train_loss = float(np.mean(train_losses))
         do_eval    = (epoch + 1) % args.eval_every == 0 or epoch == args.epochs - 1
@@ -580,8 +655,20 @@ def train(planet_obs=None, ships_target=None, owner_mask=None, returns=None,
             val_loss = best_val  # use last known for checkpoint gating
             print(f"Epoch {epoch+1:>3d}/{args.epochs} | train={train_loss:.4f} | {time.time()-t0:.1f}s  {_rezero_summary(params)}")
 
-        if (epoch + 1) % 10 == 0:
+        if (epoch + 1) % 10 == 0 or epoch == 0:
             _log_rezero(params, label=f'actor epoch {epoch+1}')
+
+        if args.checkpoint_every > 0 and (epoch + 1) % args.checkpoint_every == 0:
+            ckpt = {
+                'epoch':     epoch + 1,
+                'best_val':  best_val,
+                'history':   history,
+                'params':    jax.tree_util.tree_map(np.array, params),
+                'opt_state': jax.tree_util.tree_map(np.array, opt_state),
+            }
+            with open(resume_path, 'wb') as f:
+                pickle.dump(ckpt, f)
+            _upload_to_r2(args.out, hist_path, resume_path)
 
         if val_loss < best_val:
             best_val = val_loss
@@ -632,8 +719,15 @@ def pretrain_critic(planet_obs=None, returns=None, fleet_obs=None, fleet_mask=No
     critic = Critic(hidden_dim=HIDDEN_DIM, num_sa_layers=NUM_SA_LAYERS, rngs=nnx.Rngs(1))
     critic_graph, params = nnx.split(critic)
 
-    total_steps = (N_train // args.batch_size) * args.critic_epochs
-    schedule    = optax.cosine_decay_schedule(args.lr, total_steps, alpha=0.1)
+    steps_per_epoch = N_train // args.batch_size
+    warmup_steps    = args.warmup_epochs * steps_per_epoch
+    schedule = optax.join_schedules(
+        schedules=[
+            optax.linear_schedule(args.lr * 0.1, args.lr, warmup_steps),
+            optax.constant_schedule(args.lr),
+        ],
+        boundaries=[warmup_steps],
+    )
     opt         = optax.adamw(learning_rate=schedule, weight_decay=args.weight_decay)
     opt_state   = opt.init(params)
 
@@ -666,7 +760,9 @@ def pretrain_critic(planet_obs=None, returns=None, fleet_obs=None, fleet_mask=No
         shuffled = rng.permutation(N_train)
 
         train_losses = []
-        for start in range(0, N_train - args.batch_size, args.batch_size):
+        batch_iter = _bar(range(0, N_train - args.batch_size, args.batch_size),
+                          desc=f'C{epoch+1}/{args.critic_epochs}')
+        for start in batch_iter:
             bi = tr_idx[shuffled[start:start + args.batch_size]]
             params, opt_state, loss = train_step(
                 params, opt_state,
@@ -675,7 +771,10 @@ def pretrain_critic(planet_obs=None, returns=None, fleet_obs=None, fleet_mask=No
                 jnp.array(fleet_obs[bi]),
                 jnp.array(fleet_mask[bi]),
             )
-            train_losses.append(float(loss))
+            loss_val = float(loss)
+            train_losses.append(loss_val)
+            if _tqdm is not None:
+                batch_iter.set_postfix(loss=f'{loss_val:.4f}')
 
         train_loss = float(np.mean(train_losses))
         do_eval    = (epoch + 1) % args.eval_every == 0 or epoch == args.critic_epochs - 1
@@ -706,8 +805,11 @@ def pretrain_critic(planet_obs=None, returns=None, fleet_obs=None, fleet_mask=No
             val_loss = best_val
             print(f"Epoch {epoch+1:>3d}/{args.critic_epochs} | train={train_loss:.4f} | {time.time()-t0:.1f}s  {_rezero_summary(params)}")
 
-        if (epoch + 1) % 10 == 0:
+        if (epoch + 1) % 10 == 0 or epoch == 0:
             _log_rezero(params, label=f'critic epoch {epoch+1}')
+
+        if args.checkpoint_every > 0 and (epoch + 1) % args.checkpoint_every == 0:
+            _upload_to_r2(args.critic_out)
 
         if val_loss < best_val:
             best_val = val_loss

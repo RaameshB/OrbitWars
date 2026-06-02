@@ -66,7 +66,6 @@ class PlanetCrossAttentionBlock(nnx.Module):
             jax.nn.silu,
             nnx.Linear(16, 2, rngs=rngs)
         )
-        self.rel_bias_alpha = nnx.Param(jnp.zeros(()))
 
         # Cross Attention: Planets attend to Fleets
         self.cross_attn = nnx.MultiHeadAttention(
@@ -109,7 +108,7 @@ class PlanetCrossAttentionBlock(nnx.Module):
             
         # Relative Bias
         rel_feats = get_relative_features(p_coords, f_coords) # [..., Q, KV, 3]
-        bias_logits = self.rel_bias_alpha[...] * self.rel_bias_mlp(rel_feats) # [..., Q, KV, num_heads]
+        bias_logits = self.rel_bias_mlp(rel_feats) # [..., Q, KV, num_heads]
         bias_logits = jnp.moveaxis(bias_logits, -1, -3) # [..., num_heads, Q, KV]
         
         # We need to manually add the bias to the attention matrix if using Flax nnx
@@ -143,7 +142,6 @@ class PlanetSelfAttentionBlock(nnx.Module):
             jax.nn.silu,
             nnx.Linear(16, 2, rngs=rngs)
         )
-        self.rel_bias_alpha = nnx.Param(jnp.zeros(()))
         self.ffn = nnx.Sequential(
             nnx.Linear(hidden_dim, hidden_dim * 2, rngs=rngs),
             jax.nn.silu,
@@ -154,7 +152,7 @@ class PlanetSelfAttentionBlock(nnx.Module):
     def __call__(self, p_emb, p_coords, planet_mask=None):
 
         rel_feats = get_relative_features(p_coords, p_coords) # [..., 60, 60, 3]
-        bias_logits = self.rel_bias_alpha[...] * self.rel_bias_mlp(rel_feats) # [..., 60, 60, num_heads]
+        bias_logits = self.rel_bias_mlp(rel_feats) # [..., 60, 60, num_heads]
         attn_bias = jnp.moveaxis(bias_logits, -1, -3) # [..., num_heads, 60, 60]
 
         if planet_mask is not None:

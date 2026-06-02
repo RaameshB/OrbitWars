@@ -673,13 +673,13 @@ def step(state: EnvState, params: EnvParams, actions: EnvAction, num_players: in
     flat_angles = actions.angle.reshape(-1)
     planet_idx = jnp.arange(MAX_MOVES_PER_STEP) // MAX_FLEETS_PER_PLANET_PER_STEP
 
-    ships_requested = jnp.sum(jnp.where(actions.ships > 0, actions.ships, 0), axis=1)
-    planet_can_launch = active_bodies & (state.planet_owners != -1) & (state.planet_ships >= ships_requested)
-
-    valid_launch = (flat_ships > 0) & planet_can_launch[planet_idx]
+    planet_base_valid = active_bodies & (state.planet_owners != -1)
+    cumsum_ships = jnp.cumsum(jnp.maximum(actions.ships, 0), axis=-1)  # [MAX_BODIES, MAX_FLEETS_PER_PLANET]
+    slot_can_launch = (cumsum_ships <= state.planet_ships[:, None]) & planet_base_valid[:, None]
+    valid_launch = (flat_ships > 0) & slot_can_launch.reshape(-1)
 
     # Deduct ships
-    actual_deducted = jnp.sum(jnp.where(actions.ships > 0, actions.ships, 0) * planet_can_launch[:, None], axis=1)
+    actual_deducted = jnp.sum(jnp.where(slot_can_launch, jnp.maximum(actions.ships, 0), 0), axis=-1)
     new_planet_ships = state.planet_ships - actual_deducted
 
     # Fleet start positions
@@ -760,11 +760,20 @@ def step(state: EnvState, params: EnvParams, actions: EnvAction, num_players: in
         (disc >= 0.0) & (t2 >= 0.0) & (t1 <= 1.0),
         c_c <= 0.0,
     )
-    hit_matrix = within_radius & active_fleets[:, None] & active_bodies[None, :]
+    is_first_tick_comet = params.is_comet & (ages == 0)
+    hit_matrix = within_radius & active_fleets[:, None] & active_bodies[None, :] & ~is_first_tick_comet[None, :]
     fleet_hit_planet = jnp.any(hit_matrix, axis=1)
 
-    # Sun Hits
-    sun_dist = distance(moved_fleet_coords, jnp.array([CENTER, CENTER]))
+    # Sun Hits — swept segment check (center point of sun vs fleet path A→B)
+    sun_center = jnp.array([CENTER, CENTER])
+    AB = moved_fleet_coords - new_fleet_coords           # [F, 2] fleet displacement
+    AP = sun_center - new_fleet_coords                   # [F, 2]
+    ab_sq = jnp.sum(AB * AB, axis=-1)                   # [F]
+    t_sun = jnp.where(ab_sq > 1e-10,
+                      jnp.clip(jnp.sum(AP * AB, axis=-1) / ab_sq, 0.0, 1.0),
+                      0.0)
+    closest_to_sun = new_fleet_coords + t_sun[:, None] * AB
+    sun_dist = distance(closest_to_sun, sun_center)
     fleet_hit_sun = active_fleets & (sun_dist < SUN_RADIUS)
 
     # OOB Hits

@@ -122,6 +122,6 @@ def build_obs_arrays(state, params, pid, num_players):
         state.fleet_ship_count.astype(jnp.float32),
     ], axis=-1)  # [MAX_FLEETS, 6]
 
-    p_mask = state.planet_owners != -1
+    p_mask = active_body_mask(state, params)
     f_mask = state.fleet_owners != -1
     return planets, fleets, p_mask, f_mask
