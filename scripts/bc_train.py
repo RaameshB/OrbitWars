@@ -44,7 +44,7 @@ parser.add_argument('--top-k',          type=int,   default=10)
 parser.add_argument('--min-games',      type=int,   default=20)
 parser.add_argument('--epochs',         type=int,   default=50)
 parser.add_argument('--critic-epochs',  type=int,   default=30)
-parser.add_argument('--batch-size',     type=int,   default=1024)
+parser.add_argument('--batch-size',     type=int,   default=512)
 parser.add_argument('--lr',             type=float, default=3e-3)
 parser.add_argument('--weight-decay',   type=float, default=1e-2,
                     help='AdamW weight decay (grokking-inspired; applied to 1D params via Muon)')
