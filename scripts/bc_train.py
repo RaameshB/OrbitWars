@@ -45,14 +45,14 @@ parser.add_argument('--min-games',      type=int,   default=20)
 parser.add_argument('--epochs',         type=int,   default=50)
 parser.add_argument('--critic-epochs',  type=int,   default=30)
 parser.add_argument('--batch-size',     type=int,   default=512)
-parser.add_argument('--lr',             type=float, default=1e-1)
-parser.add_argument('--weight-decay',   type=float, default=2e-4)
+parser.add_argument('--lr',             type=float, default=1.6e-2)
+parser.add_argument('--weight-decay',   type=float, default=0.0)
 parser.add_argument('--gamma',          type=float, default=0.99,
                     help='Discount factor for Monte Carlo returns in critic pretraining')
 parser.add_argument('--val-frac',       type=float, default=0.1,
                     help='Fraction of data held out for validation loss tracking')
-parser.add_argument('--warmup-epochs',  type=int,   default=30,
-                    help='Linear LR warmup from lr/100 to lr over this many epochs (one-cycle phase 1)')
+parser.add_argument('--warmup-epochs',  type=int,   default=0,
+                    help='Linear LR warmup epochs (0 = no warmup, fixed LR from step 1 per ReZero paper)')
 parser.add_argument('--alpha-lr-scale', type=float, default=0.08,
                     help='ReZero α LR as fraction of peak --lr; kept constant throughout (paper §E.2)')
 parser.add_argument('--resume',         action='store_true',
@@ -135,7 +135,7 @@ def _log_rezero(params, label: str = ''):
     print(f"  {tag}ReZero α  dead={dead}/{len(vals)}  "
           f"mean={vals.mean():.4f}  max={vals.max():.4f}")
     for name, v in named:
-        bar = '█' * int(min(abs(v) * 200, 30))
+        bar = '█' * (int(min(abs(v) * 200, 30)) if math.isfinite(v) else 0)
         sign = '+' if v >= 0 else '-'
         print(f"    {name:<55s} {sign}{abs(v):.5f}  {bar}")
 
@@ -565,22 +565,11 @@ def train(planet_obs=None, ships_target=None, owner_mask=None, returns=None,
     actor_graph, params = nnx.split(actor)
 
     steps_per_epoch = N_train // args.batch_size
-    total_steps     = steps_per_epoch * args.epochs
-    warmup_steps    = args.warmup_epochs * steps_per_epoch
-    min_lr          = args.lr * 0.01
-    alpha_lr        = args.lr * args.alpha_lr_scale
+    alpha_lr = args.lr * args.alpha_lr_scale
 
-    # One-cycle: linear warmup to peak, cosine decay back to min (Smith 2019 / ReZero §E.2)
-    decay_steps = max(total_steps - warmup_steps, 1)
-    main_schedule = optax.join_schedules(
-        schedules=[
-            optax.linear_schedule(min_lr, args.lr, warmup_steps),
-            optax.cosine_decay_schedule(args.lr, decay_steps, alpha=min_lr / args.lr),
-        ],
-        boundaries=[warmup_steps],
-    )
-    # α (ReZero residual weights) get a fixed low LR — they cannot tolerate large LR swings
-    main_opt  = optax.adan(learning_rate=main_schedule, weight_decay=args.weight_decay)
+    # Fixed LR throughout — ReZero paper (Appendix B) uses no schedule with LAMB.
+    # α gets a separate constant LR (paper §E.2: residual weights need stable LR).
+    main_opt  = optax.lamb(learning_rate=args.lr, weight_decay=args.weight_decay)
     alpha_opt = optax.adam(learning_rate=alpha_lr)
 
     def _param_labels(p):
