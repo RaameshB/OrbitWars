@@ -29,3 +29,5 @@ public/
 AGENT_NOTES.md
 .claude/settings.local.json
 data/*.npz
+models/*.pkl
+tmp/

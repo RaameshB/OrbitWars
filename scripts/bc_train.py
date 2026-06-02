@@ -17,7 +17,7 @@ v13.1 preprocessing changes vs v13:
   - Training loss: diagonal included as valid target, has_ships mask replaces has_action
 """
 
-import os, sys, math, pickle, argparse, time, json, subprocess
+import os, sys, math, pickle, argparse, time, json, subprocess, multiprocessing as mp
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 try:
@@ -49,7 +49,7 @@ parser.add_argument('--data-dir',       default='/tmp/orbit-wars-parquet')
 parser.add_argument('--bc-data',        default='/tmp/bc_data.npz')
 parser.add_argument('--out',            default='/tmp/weights_bc.pkl')
 parser.add_argument('--critic-out',     default='/tmp/weights_bc_critic.pkl')
-parser.add_argument('--top-k',          type=int,   default=20)
+parser.add_argument('--top-k',          type=int,   default=10)
 parser.add_argument('--min-games',      type=int,   default=20)
 parser.add_argument('--duel-weight',    type=int,   default=2,
                     help='Oversample 2-player games by this factor at training time')
@@ -74,12 +74,24 @@ parser.add_argument('--transfer-from',   type=str,   default='',
                     help='Path to v13 weights.pkl to warm-start from (reinits action head + fleet MLPs)')
 parser.add_argument('--eval-every',     type=int,   default=1,
                     help='Run val loss every N epochs (set >1 to save compute)')
+parser.add_argument('--workers',        type=int,   default=max(1, mp.cpu_count() // 2),
+                    help='Parallel workers for preprocessing (fork, COW shared arrays)')
+parser.add_argument('--flush-every',    type=int,   default=50_000,
+                    help='Flush partial results to disk every N samples per worker (caps peak RAM)')
+parser.add_argument('--upload-to-kaggle', type=str, default='',
+                    help='Kaggle dataset slug (owner/dataset-name) to upload bc_data npz as a new version')
 args = parser.parse_args()
 
 HIDDEN_DIM    = 48
 NUM_SA_LAYERS = 6
 SHIP_SPEED    = 6.0
 MAX_FLEET_OBS = 128
+
+# ---------------------------------------------------------------------------
+# Shared state for forked preprocessing workers (populated before Pool creation;
+# fork() gives each worker a COW view — no copying of the large dicts).
+# ---------------------------------------------------------------------------
+_G: dict = {}
 
 # ---------------------------------------------------------------------------
 # ReZero alpha logging — all scalars (ndim==0) in the params pytree are alphas;
@@ -154,6 +166,228 @@ def _classify_batch(src_xs, src_ys, angles, planet_xs, planet_ys, planet_rs, src
 
 
 # ---------------------------------------------------------------------------
+# Preprocessing worker — called in forked subprocess, reads _G via COW.
+# Processes a chunk of (eid, slot, n_p) tuples and writes results to a temp npz.
+# ---------------------------------------------------------------------------
+def _flush_chunk(lists, out_dir, worker_id, flush_idx):
+    """Write accumulated lists to a numbered sub-chunk file and return its path."""
+    out_path = os.path.join(out_dir, f'chunk_{worker_id:04d}_{flush_idx:04d}.npz')
+    np.savez_compressed(
+        out_path,
+        planet_obs  = np.stack(lists[0]),
+        ships_target= np.stack(lists[1]),
+        owner_mask  = np.stack(lists[2]),
+        returns     = np.array(lists[3], dtype=np.float32),
+        fleet_obs   = np.stack(lists[4]),
+        fleet_mask  = np.stack(lists[5]),
+        n_players   = np.array(lists[6], dtype=np.int8),
+    )
+    return out_path
+
+
+def _preprocess_chunk(args_tuple):
+    chunk, worker_id, out_dir, shared_dir, gamma, mfo, flush_every = args_tuple
+
+    # Load shared arrays via mmap — OS shares physical pages across all spawned workers
+    def _m(name): return np.load(os.path.join(shared_dir, f'{name}.npy'), mmap_mode='r')
+
+    grp_ep        = _m('grp_ep');    grp_tick   = _m('grp_tick')
+    grp_starts    = _m('grp_starts')
+    ps_pid        = _m('ps_pid');    ps_own     = _m('ps_own')
+    ps_x          = _m('ps_x');      ps_y       = _m('ps_y')
+    ps_shp        = _m('ps_shp');    ps_rad     = _m('ps_rad');   ps_prd = _m('ps_prd')
+    unique_eps    = _m('unique_eps'); max_tick_vals = _m('max_tick_vals')
+    act_grp_ep    = _m('act_grp_ep'); act_grp_slot = _m('act_grp_slot')
+    act_grp_tick  = _m('act_grp_tick'); act_grp_starts = _m('act_grp_starts')
+    act_pid = _m('act_pid'); act_ang = _m('act_ang'); act_nsh = _m('act_nsh')
+    fleet_ep_ids  = _m('fleet_ep_ids');  fleet_offsets = _m('fleet_offsets')
+    fleet_flat    = _m('fleet_flat')
+    out_ep        = _m('out_ep');    out_slot = _m('out_slot');   out_val = _m('out_val')
+
+    planet_obs_list   = []
+    ships_target_list = []
+    owner_mask_list   = []
+    returns_list      = []
+    fleet_obs_list    = []
+    fleet_mask_list   = []
+    n_players_list    = []
+
+    out_paths   = []
+    flush_idx   = 0
+    total_count = 0
+
+    def _maybe_flush():
+        nonlocal flush_idx, total_count
+        lists = [planet_obs_list, ships_target_list, owner_mask_list,
+                 returns_list, fleet_obs_list, fleet_mask_list, n_players_list]
+        n = len(planet_obs_list)
+        if n >= flush_every:
+            out_paths.append(_flush_chunk(lists, out_dir, worker_id, flush_idx))
+            flush_idx   += 1
+            total_count += n
+            for lst in lists:
+                lst.clear()
+
+    for eid, slot, n_p in chunk:
+        # Episode range in planet CSR
+        ep_lo = int(np.searchsorted(grp_ep, eid, side='left'))
+        ep_hi = int(np.searchsorted(grp_ep, eid, side='right'))
+        if ep_lo == ep_hi:
+            continue
+
+        # max_tick via numpy lookup
+        mt_idx   = int(np.searchsorted(unique_eps, eid))
+        max_tick = int(max_tick_vals[mt_idx]) if (mt_idx < len(unique_eps) and unique_eps[mt_idx] == eid) else 400
+
+        # (ep, slot) range in acts CSR — constant for this (eid, slot), cache outside tick loop
+        ae_lo  = int(np.searchsorted(act_grp_ep, eid, side='left'))
+        ae_hi  = int(np.searchsorted(act_grp_ep, eid, side='right'))
+        asl_lo = ae_lo + int(np.searchsorted(act_grp_slot[ae_lo:ae_hi], slot, side='left'))
+        asl_hi = ae_lo + int(np.searchsorted(act_grp_slot[ae_lo:ae_hi], slot, side='right'))
+
+        theta    = -slot * (2.0 * math.pi / n_p)
+        cos_t, sin_t = math.cos(theta), math.sin(theta)
+        # outcome: CSR lookup in sorted (out_ep, out_slot) arrays
+        _oe_lo = int(np.searchsorted(out_ep, eid, side='left'))
+        _oe_hi = int(np.searchsorted(out_ep, eid, side='right'))
+        _oi = _oe_lo + int(np.searchsorted(out_slot[_oe_lo:_oe_hi], slot, side='left'))
+        outcome = float(out_val[_oi]) if (_oi < _oe_hi and out_ep[_oi] == eid and out_slot[_oi] == slot) else 0.0
+
+        for gi in range(ep_lo, ep_hi):
+            tick = int(grp_tick[gi])
+            lo   = int(grp_starts[gi])
+            hi   = int(grp_starts[gi + 1])
+            pids      = ps_pid[lo:hi];   owners    = ps_own[lo:hi]
+            xs        = ps_x[lo:hi];     ys        = ps_y[lo:hi]
+            ships_arr = ps_shp[lo:hi];   radii     = ps_rad[lo:hi];  prods = ps_prd[lo:hi]
+            n_pl = len(pids)
+            if n_pl == 0:
+                continue
+
+            owned_mask = owners == slot
+            if not owned_mask.any():
+                continue
+            owned_slots_arr = np.where(owned_mask)[0]
+
+            # Enemy encoding: rank by current ship count
+            enemy_players = sorted(set(int(o) for o in owners if o >= 0 and o != slot))
+            enemy_ships_total = [(p, float(ships_arr[owners == p].sum())) for p in enemy_players]
+            enemy_ships_total.sort(key=lambda x: -x[1])
+            k = len(enemy_ships_total)
+            enemy_rel_map = {p: -(k - rank) / k for rank, (p, _) in enumerate(enemy_ships_total)}
+
+            slots_arr = np.arange(n_pl)
+            dx = xs - 50.0;  dy = ys - 50.0
+            rot_x = dx * cos_t - dy * sin_t + 50.0
+            rot_y = dx * sin_t + dy * cos_t + 50.0
+            rel_owners = np.zeros(n_pl, dtype=np.float32)
+            rel_owners[owners == slot] = 1.0
+            for ep, rel_val in enemy_rel_map.items():
+                rel_owners[owners == ep] = rel_val
+
+            p_arr = np.zeros((60, 7), dtype=np.float32)
+            p_arr[slots_arr, 0] = slots_arr.astype(np.float32)
+            p_arr[slots_arr, 1] = rel_owners
+            p_arr[slots_arr, 2] = rot_x
+            p_arr[slots_arr, 3] = rot_y
+            p_arr[slots_arr, 4] = radii
+            p_arr[slots_arr, 5] = ships_arr
+            p_arr[slots_arr, 6] = prods
+
+            ships_target = np.zeros((60, 60), dtype=np.float32)
+
+            # Acts CSR lookup: find tick within the cached (ep, slot) range
+            if asl_lo < asl_hi:
+                atk = asl_lo + int(np.searchsorted(act_grp_tick[asl_lo:asl_hi], tick, side='left'))
+                if atk < asl_hi and act_grp_tick[atk] == tick:
+                    alo = int(act_grp_starts[atk])
+                    ahi = int(act_grp_starts[atk + 1])
+                    src_pids_act = act_pid[alo:ahi]
+                    angles_act   = act_ang[alo:ahi]
+                    nships_act   = act_nsh[alo:ahi]
+                    pid_to_idx = {int(p): i for i, p in enumerate(pids)}
+                    src_idxs = np.fromiter(
+                        (pid_to_idx.get(int(p), -1) for p in src_pids_act),
+                        dtype=np.int32, count=len(src_pids_act)
+                    )
+                    valid = (src_idxs >= 0) & np.isin(src_idxs, owned_slots_arr)
+                    if valid.any():
+                        src_v    = src_idxs[valid]
+                        angles_v = angles_act[valid]
+                        nships_v = nships_act[valid]
+                        tgt_slots = _classify_batch(
+                            xs[src_v], ys[src_v], angles_v,
+                            xs[:n_pl], ys[:n_pl], radii[:n_pl], src_v
+                        )
+                        hit_mask = tgt_slots >= 0
+                        if hit_mask.any():
+                            np.add.at(ships_target,
+                                      (src_v[hit_mask], tgt_slots[hit_mask]),
+                                      nships_v[hit_mask])
+
+            for i in owned_slots_arr:
+                launched = float(ships_target[i, :].sum())
+                held = max(float(ships_arr[i]) - launched, 0.0)
+                ships_target[i, i] = held
+
+            if ships_target[owned_slots_arr, :].sum() == 0:
+                continue
+
+            owner_mask_out = np.zeros(60, dtype=bool)
+            owner_mask_out[owned_slots_arr] = True
+
+            ret = (gamma ** (max_tick - tick)) * outcome
+
+            fleet_arr      = np.zeros((mfo, 6), dtype=np.float32)
+            fleet_mask_arr = np.zeros(mfo, dtype=bool)
+            _fi = int(np.searchsorted(fleet_ep_ids, eid, side='left'))
+            if _fi < len(fleet_ep_ids) and fleet_ep_ids[_fi] == eid:
+                _flo = int(fleet_offsets[_fi]); _fhi = int(fleet_offsets[_fi + 1])
+                fa   = fleet_flat[_flo:_fhi]   # view, no copy
+                in_t = fa[(fa[:, 0] <= tick) & (fa[:, 1] > tick)]
+                if len(in_t) > mfo:
+                    in_t = in_t[:mfo]
+                K = len(in_t)
+                if K > 0:
+                    dt    = tick - in_t[:, 0]
+                    speed = _fleet_speed_batch(in_t[:, 6])
+                    r_src = in_t[:, 7]
+                    cx    = in_t[:, 3] + np.cos(in_t[:, 5]) * (r_src + speed * dt)
+                    cy    = in_t[:, 4] + np.sin(in_t[:, 5]) * (r_src + speed * dt)
+                    fdx   = cx - 50.0;  fdy = cy - 50.0
+                    fleet_owner_slots = in_t[:, 2].astype(np.int32)
+                    fleet_rel = np.zeros(K, dtype=np.float32)
+                    fleet_rel[fleet_owner_slots == slot] = 1.0
+                    for ep, rel_val in enemy_rel_map.items():
+                        fleet_rel[fleet_owner_slots == ep] = rel_val
+                    fleet_arr[:K, 0] = np.arange(K, dtype=np.float32)
+                    fleet_arr[:K, 1] = fleet_rel
+                    fleet_arr[:K, 2] = in_t[:, 5] + theta
+                    fleet_arr[:K, 3] = fdx * cos_t - fdy * sin_t + 50.0
+                    fleet_arr[:K, 4] = fdx * sin_t + fdy * cos_t + 50.0
+                    fleet_arr[:K, 5] = in_t[:, 6]
+                    fleet_mask_arr[:K] = True
+
+            planet_obs_list.append(p_arr.astype(np.float16))
+            ships_target_list.append(ships_target.astype(np.float16))
+            owner_mask_list.append(owner_mask_out)
+            returns_list.append(np.float32(ret))
+            fleet_obs_list.append(fleet_arr.astype(np.float16))
+            fleet_mask_list.append(fleet_mask_arr)
+            n_players_list.append(np.int8(n_p))
+            _maybe_flush()
+
+    # Final partial flush
+    if planet_obs_list:
+        lists = [planet_obs_list, ships_target_list, owner_mask_list,
+                 returns_list, fleet_obs_list, fleet_mask_list, n_players_list]
+        out_paths.append(_flush_chunk(lists, out_dir, worker_id, flush_idx))
+        total_count += len(planet_obs_list)
+
+    return out_paths, total_count
+
+
+# ---------------------------------------------------------------------------
 # PREPROCESS  (Polars + vectorised numpy — no iterrows)
 # ---------------------------------------------------------------------------
 def preprocess():
@@ -208,78 +442,86 @@ def preprocess():
             pl.col('planet_id').cast(pl.Int32),
         ]))
 
-    # Build (episode_id, tick) → numpy arrays dict
-    print("Indexing planet state by (episode, tick)...")
+    # Build CSR planet-state arrays (replaces ps_dict + all_ticks_by_ep).
+    # Numpy flat arrays bypass Python refcounting in forked workers → no COW per lookup.
+    print("Indexing planet state (CSR arrays)...")
     t1 = time.time()
-    ps_grouped = (ps_full
-        .sort(['episode_id', 'tick', 'planet_id'])
-        .group_by(['episode_id', 'tick'], maintain_order=True)
-        .agg([
-            pl.col('planet_id'), pl.col('owner'),
-            pl.col('x'), pl.col('y'), pl.col('ships'),
-            pl.col('radius'), pl.col('production'),
-        ]))
+    ps_full_sorted = ps_full.sort(['episode_id', 'tick', 'planet_id'])
+    ps_ep   = ps_full_sorted['episode_id'].to_numpy().astype(np.int64)
+    ps_tick = ps_full_sorted['tick'].to_numpy().astype(np.int32)
+    ps_pid  = ps_full_sorted['planet_id'].to_numpy().astype(np.int32)
+    ps_own  = ps_full_sorted['owner'].to_numpy().astype(np.int32)
+    ps_x    = ps_full_sorted['x'].to_numpy().astype(np.float32)
+    ps_y    = ps_full_sorted['y'].to_numpy().astype(np.float32)
+    ps_shp  = ps_full_sorted['ships'].to_numpy().astype(np.float32)
+    ps_rad  = ps_full_sorted['radius'].to_numpy().astype(np.float32)
+    ps_prd  = ps_full_sorted['production'].to_numpy().astype(np.float32)
+    del ps_full_sorted, ps_full
 
-    ps_dict = {}
-    for row in ps_grouped.iter_rows(named=True):
-        ps_dict[(row['episode_id'], row['tick'])] = (
-            np.asarray(row['planet_id'], dtype=np.int32),
-            np.asarray(row['owner'],     dtype=np.int32),
-            np.asarray(row['x'],         dtype=np.float32),
-            np.asarray(row['y'],         dtype=np.float32),
-            np.asarray(row['ships'],     dtype=np.float32),
-            np.asarray(row['radius'],    dtype=np.float32),
-            np.asarray(row['production'],dtype=np.float32),
-        )
-    print(f"  {len(ps_dict):,} (episode, tick) groups in {time.time()-t1:.1f}s")
+    is_new     = np.concatenate([[True],
+        (ps_ep[1:] != ps_ep[:-1]) | (ps_tick[1:] != ps_tick[:-1]), [True]])
+    grp_starts = np.where(is_new)[0].astype(np.int64)  # (N_groups+1,)
+    grp_ep     = ps_ep[grp_starts[:-1]]                # (N_groups,) non-decreasing
+    grp_tick   = ps_tick[grp_starts[:-1]]              # sorted within each episode
+    del is_new
 
-    # Episode max tick (for computing discounted returns)
-    # Also build all_ticks_by_ep so we can iterate ALL ticks per episode (not just action ticks)
-    max_tick_by_ep = {}
-    all_ticks_by_ep = {}
-    for (eid, tick) in ps_dict:
-        if eid not in max_tick_by_ep or tick > max_tick_by_ep[eid]:
-            max_tick_by_ep[eid] = tick
-        all_ticks_by_ep.setdefault(eid, []).append(tick)
-    for eid in all_ticks_by_ep:
-        all_ticks_by_ep[eid].sort()
+    # max_tick per episode as a numpy lookup (avoids Python dict)
+    unique_eps    = np.unique(grp_ep)
+    max_tick_vals = np.array(
+        [grp_tick[grp_ep == e].max() for e in unique_eps], dtype=np.int32)
 
-    # Outcome lookup: (episode_id, slot) → is_winner float
+    # Outcome lookup stays as a small Python dict (~16K entries, minimal COW cost)
     outcome_lookup = {
         (row[0], row[1]): float(row[2])
         for row in top_pe.select(['episode_id', 'slot', 'is_winner']).iter_rows()
     }
+    print(f"  {len(grp_ep):,} (episode, tick) groups in {time.time()-t1:.1f}s")
 
-    # Build (episode_id, slot, tick) → action arrays dict
-    print("Indexing actions by (episode, slot, tick)...")
+    # Build CSR action arrays (replaces acts_dict).
+    print("Indexing actions (CSR arrays)...")
     t2 = time.time()
-    acts_grouped = (actions_df
+    acts_sorted = (actions_df
         .with_columns([
             pl.col('src_planet_id').cast(pl.Int32),
             pl.col('n_ships').cast(pl.Float32),
             pl.col('angle').cast(pl.Float32),
             pl.col('slot').cast(pl.Int32),
         ])
-        .group_by(['episode_id', 'slot', 'tick'])
-        .agg([pl.col('src_planet_id'), pl.col('angle'), pl.col('n_ships')]))
+        .sort(['episode_id', 'slot', 'tick']))
+    act_ep   = acts_sorted['episode_id'].to_numpy().astype(np.int64)
+    act_slot = acts_sorted['slot'].to_numpy().astype(np.int32)
+    act_tick = acts_sorted['tick'].to_numpy().astype(np.int32)
+    act_pid  = acts_sorted['src_planet_id'].to_numpy().astype(np.int32)
+    act_ang  = acts_sorted['angle'].to_numpy().astype(np.float32)
+    act_nsh  = acts_sorted['n_ships'].to_numpy().astype(np.float32)
+    del acts_sorted
 
-    acts_dict  = {}
-    tick_index = {}
-    for row in acts_grouped.iter_rows(named=True):
-        key = (row['episode_id'], row['slot'], row['tick'])
-        acts_dict[key] = (
-            np.asarray(row['src_planet_id'], dtype=np.int32),
-            np.asarray(row['angle'],         dtype=np.float32),
-            np.asarray(row['n_ships'],       dtype=np.float32),
-        )
-        ep_slot = (row['episode_id'], row['slot'])
-        if ep_slot not in tick_index:
-            tick_index[ep_slot] = []
-        tick_index[ep_slot].append(row['tick'])
-    print(f"  {len(acts_dict):,} (episode, slot, tick) groups in {time.time()-t2:.1f}s")
+    is_new_act = np.concatenate([[True],
+        (act_ep[1:] != act_ep[:-1]) |
+        (act_slot[1:] != act_slot[:-1]) |
+        (act_tick[1:] != act_tick[:-1]), [True]])
+    act_grp_starts = np.where(is_new_act)[0].astype(np.int64)
+    act_grp_ep     = act_ep[act_grp_starts[:-1]]
+    act_grp_slot   = act_slot[act_grp_starts[:-1]]
+    act_grp_tick   = act_tick[act_grp_starts[:-1]]
+    del is_new_act
+    print(f"  {len(act_grp_ep):,} (episode, slot, tick) action groups in {time.time()-t2:.1f}s")
 
-    # Build per-episode fleet transit event table (all players, all ticks)
-    # Each event: [launch_tick, arrival_tick, owner_slot, launch_x, launch_y, angle, n_ships]
+    # Helper: CSR lookup for planet state (used in fleet event building below)
+    def _csr_ps(eid, tick):
+        ep_lo = int(np.searchsorted(grp_ep, eid, side='left'))
+        ep_hi = int(np.searchsorted(grp_ep, eid, side='right'))
+        if ep_lo == ep_hi:
+            return None
+        rel = int(np.searchsorted(grp_tick[ep_lo:ep_hi], tick, side='left'))
+        gi  = ep_lo + rel
+        if gi >= ep_hi or grp_tick[gi] != tick:
+            return None
+        lo, hi = int(grp_starts[gi]), int(grp_starts[gi + 1])
+        return (ps_pid[lo:hi], ps_own[lo:hi], ps_x[lo:hi], ps_y[lo:hi],
+                ps_shp[lo:hi], ps_rad[lo:hi], ps_prd[lo:hi])
+
+    # Build per-episode fleet transit event table
     print("Building fleet transit events...")
     t_fleet = time.time()
     all_ep_acts = (actions_df
@@ -294,9 +536,10 @@ def preprocess():
     _ep_events = {}
     for row in all_ep_acts.iter_rows(named=True):
         eid, tick, fslot = row['episode_id'], row['tick'], int(row['slot'])
-        if (eid, tick) not in ps_dict:
+        ps_row = _csr_ps(eid, tick)
+        if ps_row is None:
             continue
-        pids, owners, xs, ys, _, radii, _ = ps_dict[(eid, tick)]
+        pids, owners, xs, ys, _, radii, _ = ps_row
         pid_to_idx = {int(p): i for i, p in enumerate(pids)}
         src_pids = np.asarray(row['src_planet_id'], dtype=np.int32)
         angles_a = np.asarray(row['angle'],          dtype=np.float32)
@@ -312,14 +555,12 @@ def preprocess():
         if not hit.any():
             continue
         sv, av, nv, tv = sv[hit], av[hit], nv[hit], tgt_slots[hit]
-        # Subtract both radii: fleet travels from source surface to target surface
         dist  = np.sqrt((xs[sv]-xs[tv])**2 + (ys[sv]-ys[tv])**2) - radii[sv] - radii[tv]
         speed = _fleet_speed_batch(nv)
         arr_dt = (np.ceil(np.maximum(dist, 0.0) / speed) + 1).astype(np.int32)
         if eid not in _ep_events:
             _ep_events[eid] = []
         for i in range(len(sv)):
-            # columns: launch_tick, arrival_tick, owner_slot, launch_x, launch_y, angle, n_ships, src_radius
             _ep_events[eid].append((
                 float(tick), float(tick + arr_dt[i]), float(fslot),
                 float(xs[sv[i]]), float(ys[sv[i]]), float(av[i]), float(nv[i]),
@@ -332,160 +573,92 @@ def preprocess():
     n_launches = sum(len(v) for v in fleet_arrays_by_ep.values())
     print(f"  {n_launches:,} fleet launches indexed in {time.time()-t_fleet:.1f}s")
 
-    # Main loop — ALL ticks per player (including wait ticks)
-    print("Processing ticks (vectorised)...")
+    # Convert fleet_arrays_by_ep (Python dict) → CSR numpy arrays for mmap sharing
+    _fleet_ep_ids = np.array(sorted(fleet_arrays_by_ep.keys()), dtype=np.int64)
+    _fleet_parts  = [fleet_arrays_by_ep[e] for e in _fleet_ep_ids]
+    _fleet_offs   = np.concatenate([[0], np.cumsum([len(f) for f in _fleet_parts])]).astype(np.int64)
+    _fleet_flat   = np.concatenate(_fleet_parts, axis=0) if _fleet_parts else np.empty((0, 8), dtype=np.float32)
+
+    # Convert outcome_lookup (Python dict) → sorted numpy arrays for mmap sharing
+    _out_items = sorted(outcome_lookup.items())
+    _out_ep    = np.array([k[0] for k, _ in _out_items], dtype=np.int64)
+    _out_slot  = np.array([k[1] for k, _ in _out_items], dtype=np.int32)
+    _out_val   = np.array([v   for _, v  in _out_items], dtype=np.float32)
+
+    # Split work across workers
+    work_items = [(int(eid), int(slot), int(n_p))
+                  for eid, slot, n_p in top_pe.select(['episode_id', 'slot', 'n_players']).iter_rows()]
+
+    n_workers  = min(args.workers, len(work_items))
+    chunk_size = max(1, len(work_items) // n_workers)
+    chunks     = [work_items[i:i + chunk_size] for i in range(0, len(work_items), chunk_size)]
+    chunk_dir  = os.path.join(os.path.dirname(args.bc_data), '_preprocess_chunks')
+    shared_dir = os.path.join(chunk_dir, 'shared')
+    os.makedirs(shared_dir, exist_ok=True)
+
+    # Save all shared arrays to .npy files; spawned workers mmap_mode='r' → OS shares pages
+    print(f"Saving shared arrays to {shared_dir}/ ...")
+    t_save = time.time()
+    for name, arr in [
+        ('grp_ep', grp_ep), ('grp_tick', grp_tick), ('grp_starts', grp_starts),
+        ('ps_pid', ps_pid), ('ps_own', ps_own), ('ps_x', ps_x), ('ps_y', ps_y),
+        ('ps_shp', ps_shp), ('ps_rad', ps_rad), ('ps_prd', ps_prd),
+        ('unique_eps', unique_eps), ('max_tick_vals', max_tick_vals),
+        ('act_grp_ep', act_grp_ep), ('act_grp_slot', act_grp_slot),
+        ('act_grp_tick', act_grp_tick), ('act_grp_starts', act_grp_starts),
+        ('act_pid', act_pid), ('act_ang', act_ang), ('act_nsh', act_nsh),
+        ('fleet_ep_ids', _fleet_ep_ids), ('fleet_offsets', _fleet_offs),
+        ('fleet_flat', _fleet_flat),
+        ('out_ep', _out_ep), ('out_slot', _out_slot), ('out_val', _out_val),
+    ]:
+        np.save(os.path.join(shared_dir, f'{name}.npy'), arr)
+    print(f"  saved in {time.time()-t_save:.1f}s")
+
+    task_args = [(chunk, i, chunk_dir, shared_dir, args.gamma, MAX_FLEET_OBS, args.flush_every)
+                 for i, chunk in enumerate(chunks)]
+
+    print(f"Processing ticks with {n_workers} workers ({len(work_items)} ep-slots, "
+          f"{len(chunks)} chunks)...")
     t3 = time.time()
-    all_planet_obs   = []
-    all_ships_target = []
-    all_owner_mask   = []
-    all_returns      = []
-    all_fleet_obs    = []
-    all_fleet_mask   = []
-    all_n_players    = []
-    processed_ticks  = 0
 
-    for eid, slot, n_p in top_pe.select(['episode_id', 'slot', 'n_players']).iter_rows():
-        ep_slot = (eid, int(slot))
+    ctx = mp.get_context('spawn')
+    with ctx.Pool(processes=n_workers) as pool:
+        chunk_results = pool.map(_preprocess_chunk, task_args)
 
-        theta = -slot * (2.0 * math.pi / n_p)
-        cos_t, sin_t = math.cos(theta), math.sin(theta)
+    processed_ticks = sum(n for _, n in chunk_results)
+    print(f"\nProcessed {processed_ticks:,} ticks in {time.time()-t3:.1f}s "
+          f"across {n_workers} workers")
 
-        outcome  = outcome_lookup.get(ep_slot, 0.0)
-        max_tick = max_tick_by_ep.get(eid, 400)
-
-        for tick in all_ticks_by_ep.get(eid, []):
-            if (eid, tick) not in ps_dict:
+    # Concatenate all sub-chunk files (each worker may have produced several)
+    print("Concatenating chunks...")
+    t4 = time.time()
+    arrays = {k: [] for k in ['planet_obs','ships_target','owner_mask',
+                               'returns','fleet_obs','fleet_mask','n_players']}
+    for out_paths, n in chunk_results:
+        if n == 0:
+            continue
+        for out_path in out_paths:
+            if not os.path.exists(out_path):
                 continue
+            d = np.load(out_path)
+            for k in arrays:
+                arrays[k].append(d[k])
+            os.remove(out_path)
+    import shutil as _shutil
+    try:
+        _shutil.rmtree(shared_dir, ignore_errors=True)
+        os.rmdir(chunk_dir)
+    except OSError:
+        pass
+    print(f"  Concatenated in {time.time()-t4:.1f}s")
 
-            pids, owners, xs, ys, ships_arr, radii, prods = ps_dict[(eid, tick)]
-            n_pl = len(pids)
-            if n_pl == 0:
-                continue
-
-            owned_mask = owners == slot
-            if not owned_mask.any():
-                continue  # player eliminated this tick
-            owned_slots_arr = np.where(owned_mask)[0]
-
-            # Enemy encoding: rank enemies by current ship count (strongest → -1.0)
-            enemy_players = sorted(set(int(o) for o in owners if o >= 0 and o != slot))
-            enemy_ships_total = [(p, float(ships_arr[owners == p].sum())) for p in enemy_players]
-            enemy_ships_total.sort(key=lambda x: -x[1])
-            k = len(enemy_ships_total)
-            enemy_rel_map = {p: -(k - rank) / k for rank, (p, _) in enumerate(enemy_ships_total)}
-
-            # Planet obs — vectorised
-            slots_arr = np.arange(n_pl)
-            dx = xs - 50.0;  dy = ys - 50.0
-            rot_x = dx * cos_t - dy * sin_t + 50.0
-            rot_y = dx * sin_t + dy * cos_t + 50.0
-
-            rel_owners = np.zeros(n_pl, dtype=np.float32)
-            rel_owners[owners == slot] = 1.0
-            for ep, rel_val in enemy_rel_map.items():
-                rel_owners[owners == ep] = rel_val
-            # neutral (owner < 0) stays 0.0
-
-            p_arr = np.zeros((60, 7), dtype=np.float32)
-            p_arr[slots_arr, 0] = slots_arr.astype(np.float32)
-            p_arr[slots_arr, 1] = rel_owners
-            p_arr[slots_arr, 2] = rot_x
-            p_arr[slots_arr, 3] = rot_y
-            p_arr[slots_arr, 4] = radii
-            p_arr[slots_arr, 5] = ships_arr
-            p_arr[slots_arr, 6] = prods
-
-            # ships_target: off-diagonal from ray-cast actions, diagonal = ships held
-            ships_target = np.zeros((60, 60), dtype=np.float32)
-
-            if (eid, slot, tick) in acts_dict:
-                src_pids_act, angles_act, nships_act = acts_dict[(eid, slot, tick)]
-                pid_to_idx = {int(p): i for i, p in enumerate(pids)}
-                src_idxs = np.fromiter(
-                    (pid_to_idx.get(int(p), -1) for p in src_pids_act),
-                    dtype=np.int32, count=len(src_pids_act)
-                )
-                valid = (src_idxs >= 0) & np.isin(src_idxs, owned_slots_arr)
-                if valid.any():
-                    src_v    = src_idxs[valid]
-                    angles_v = angles_act[valid]
-                    nships_v = nships_act[valid]
-                    tgt_slots = _classify_batch(
-                        xs[src_v], ys[src_v], angles_v,
-                        xs[:n_pl], ys[:n_pl], radii[:n_pl], src_v
-                    )
-                    hit_mask = tgt_slots >= 0
-                    if hit_mask.any():
-                        np.add.at(ships_target,
-                                  (src_v[hit_mask], tgt_slots[hit_mask]),
-                                  nships_v[hit_mask])
-
-            # Fill diagonal: ships held = ships at planet − ships launched from it
-            for i in owned_slots_arr:
-                launched = float(ships_target[i, :].sum())
-                held = max(float(ships_arr[i]) - launched, 0.0)
-                ships_target[i, i] = held
-
-            # Skip if owned planets have no ships at all (e.g., just captured, 0 ships)
-            if ships_target[owned_slots_arr, :].sum() == 0:
-                continue
-
-            owner_mask_out = np.zeros(60, dtype=bool)
-            owner_mask_out[owned_slots_arr] = True
-
-            ret = (args.gamma ** (max_tick - tick)) * outcome
-
-            # Fleet obs — in-transit fleets at this tick across all players
-            fleet_arr      = np.zeros((MAX_FLEET_OBS, 6), dtype=np.float32)
-            fleet_mask_arr = np.zeros(MAX_FLEET_OBS,      dtype=bool)
-            if eid in fleet_arrays_by_ep:
-                fa   = fleet_arrays_by_ep[eid]
-                in_t = fa[(fa[:, 0] <= tick) & (fa[:, 1] > tick)]
-                if len(in_t) > MAX_FLEET_OBS:
-                    in_t = in_t[:MAX_FLEET_OBS]
-                K = len(in_t)
-                if K > 0:
-                    dt    = tick - in_t[:, 0]
-                    speed = _fleet_speed_batch(in_t[:, 6])
-                    r_src = in_t[:, 7]
-                    cx    = in_t[:, 3] + np.cos(in_t[:, 5]) * (r_src + speed * dt)
-                    cy    = in_t[:, 4] + np.sin(in_t[:, 5]) * (r_src + speed * dt)
-                    fdx   = cx - 50.0;  fdy = cy - 50.0
-                    # Fleet enemy encoding: same ranked scheme as planets
-                    fleet_owner_slots = in_t[:, 2].astype(np.int32)
-                    fleet_rel = np.zeros(K, dtype=np.float32)
-                    fleet_rel[fleet_owner_slots == slot] = 1.0
-                    for ep, rel_val in enemy_rel_map.items():
-                        fleet_rel[fleet_owner_slots == ep] = rel_val
-                    fleet_arr[:K, 0] = np.arange(K, dtype=np.float32)
-                    fleet_arr[:K, 1] = fleet_rel
-                    fleet_arr[:K, 2] = in_t[:, 5] + theta
-                    fleet_arr[:K, 3] = fdx * cos_t - fdy * sin_t + 50.0
-                    fleet_arr[:K, 4] = fdx * sin_t + fdy * cos_t + 50.0
-                    fleet_arr[:K, 5] = in_t[:, 6]
-                    fleet_mask_arr[:K] = True
-
-            all_planet_obs.append(p_arr.astype(np.float16))
-            all_ships_target.append(ships_target.astype(np.float16))
-            all_owner_mask.append(owner_mask_out)
-            all_returns.append(np.float32(ret))
-            all_fleet_obs.append(fleet_arr.astype(np.float16))
-            all_fleet_mask.append(fleet_mask_arr)
-            all_n_players.append(np.int8(n_p))
-            processed_ticks += 1
-
-            if processed_ticks % 50_000 == 0 and processed_ticks > 0:
-                print(f"  {processed_ticks:,} ticks | {time.time()-t3:.0f}s elapsed")
-
-    print(f"\nProcessed {processed_ticks:,} ticks in {time.time()-t3:.1f}s")
-
-    planet_obs_arr   = np.stack(all_planet_obs,   axis=0)
-    ships_target_arr = np.stack(all_ships_target, axis=0)
-    owner_mask_arr   = np.stack(all_owner_mask,   axis=0)
-    returns_arr      = np.array(all_returns,      dtype=np.float32)
-    fleet_obs_arr    = np.stack(all_fleet_obs,    axis=0)
-    fleet_mask_arr   = np.stack(all_fleet_mask,   axis=0)
-    n_players_arr    = np.array(all_n_players,    dtype=np.int8)
+    planet_obs_arr   = np.concatenate(arrays['planet_obs'],   axis=0)
+    ships_target_arr = np.concatenate(arrays['ships_target'], axis=0)
+    owner_mask_arr   = np.concatenate(arrays['owner_mask'],   axis=0)
+    returns_arr      = np.concatenate(arrays['returns'],      axis=0).astype(np.float32)
+    fleet_obs_arr    = np.concatenate(arrays['fleet_obs'],    axis=0)
+    fleet_mask_arr   = np.concatenate(arrays['fleet_mask'],   axis=0)
+    n_players_arr    = np.concatenate(arrays['n_players'],    axis=0).astype(np.int8)
 
     active_fleets = fleet_mask_arr.sum(axis=1)
     print(f"  Fleet obs: mean={active_fleets.mean():.1f}  max={active_fleets.max()}  "
@@ -512,7 +685,38 @@ def preprocess():
     )
     size_mb = os.path.getsize(args.bc_data) / 1e6
     print(f"Saved {args.bc_data} ({size_mb:.1f} MB)")
+
+    if args.upload_to_kaggle:
+        _upload_to_kaggle(args.bc_data, args.upload_to_kaggle)
+
     return planet_obs_arr, ships_target_arr, owner_mask_arr, returns_arr, fleet_obs_arr, fleet_mask_arr, n_players_arr
+
+
+def _upload_to_kaggle(npz_path: str, dataset_slug: str):
+    """Upload npz_path as a new version of a Kaggle dataset (owner/name)."""
+    import shutil, tempfile
+    print(f"Uploading {npz_path} to Kaggle dataset {dataset_slug}...")
+    owner, name = dataset_slug.split('/', 1)
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.basename(npz_path)
+        shutil.copy(npz_path, os.path.join(tmp, fname))
+        meta = {
+            "title": name,
+            "id": f"{owner}/{name}",
+            "licenses": [{"name": "other"}]
+        }
+        with open(os.path.join(tmp, 'dataset-metadata.json'), 'w') as f:
+            json.dump(meta, f)
+        result = subprocess.run(
+            ['kaggle', 'datasets', 'version', '-p', tmp,
+             '-m', f'bc_data update {time.strftime("%Y-%m-%d %H:%M")}', '--dir-mode', 'tar'],
+            capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            print(f"  Kaggle upload succeeded: {result.stdout.strip()}")
+        else:
+            print(f"  Kaggle upload failed: {result.stderr.strip()}")
+            print("  (Ensure KAGGLE_USERNAME / KAGGLE_KEY are set and the dataset already exists)")
 
 
 # ---------------------------------------------------------------------------
