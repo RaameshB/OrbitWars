@@ -2,13 +2,6 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
-class ReZero(nnx.Module):
-    def __init__(self, rngs: nnx.Rngs):
-        self.alpha = nnx.Param(jnp.zeros(()))
-
-    def __call__(self, x, f_x):
-        return x + self.alpha[...] * f_x
-
 def get_fourier_features(coords, num_bands=4):
     # coords: [..., 2], board is 100×100 with CENTER=50
     norm_coords = (coords - 50.0) / 50.0
@@ -44,6 +37,9 @@ def get_relative_features(q_coords, kv_coords):
 # Shape [60, 64] — defined once, never changes across steps or games.
 _SELF_TARGET_MASK = jnp.concatenate([1.0 - jnp.eye(60), jnp.ones((60, 4))], axis=-1)
 
+# 60-only mask: diagonal zeroed, no DS bins. Used by v14+ inference.
+_SELF_TARGET_MASK_60 = 1.0 - jnp.eye(60)
+
 class PlanetCrossAttentionBlock(nnx.Module):
     def __init__(self, hidden_dim: int, rngs: nnx.Rngs):
         # 7 base features + 2*4*2 = 16 fourier + 2 norm_coords = 25 features
@@ -76,7 +72,8 @@ class PlanetCrossAttentionBlock(nnx.Module):
             rngs=rngs,
             decode=False
         )
-        self.rezero = ReZero(rngs=rngs)
+        self.norm1 = nnx.LayerNorm(hidden_dim, rngs=rngs)
+        self.norm2 = nnx.LayerNorm(hidden_dim, rngs=rngs)
         self.ffn = nnx.Sequential(
             nnx.Linear(hidden_dim, hidden_dim * 2, rngs=rngs),
             jax.nn.silu,
@@ -103,9 +100,9 @@ class PlanetCrossAttentionBlock(nnx.Module):
         if fleet_mask is not None:
             attn_bias = jnp.where(fleet_mask[..., None, None, :], attn_bias, -1e9)
 
-        ca_out = self.cross_attn(inputs_q=p_emb, inputs_k=f_emb, inputs_v=f_emb, mask=attn_bias)
-        p_emb = self.rezero(p_emb, ca_out)
-        return self.rezero(p_emb, self.ffn(p_emb))
+        ca_out = self.cross_attn(inputs_q=self.norm1(p_emb), inputs_k=f_emb, inputs_v=f_emb, mask=attn_bias)
+        p_emb = p_emb + ca_out
+        return p_emb + self.ffn(self.norm2(p_emb))
 
 
 class PlanetMidCrossAttentionBlock(nnx.Module):
@@ -129,7 +126,8 @@ class PlanetMidCrossAttentionBlock(nnx.Module):
             rngs=rngs,
             decode=False
         )
-        self.rezero = ReZero(rngs=rngs)
+        self.norm1 = nnx.LayerNorm(hidden_dim, rngs=rngs)
+        self.norm2 = nnx.LayerNorm(hidden_dim, rngs=rngs)
         self.ffn = nnx.Sequential(
             nnx.Linear(hidden_dim, hidden_dim * 2, rngs=rngs),
             jax.nn.silu,
@@ -149,9 +147,9 @@ class PlanetMidCrossAttentionBlock(nnx.Module):
         if fleet_mask is not None:
             attn_bias = jnp.where(fleet_mask[..., None, None, :], attn_bias, -1e9)
 
-        ca_out = self.cross_attn(inputs_q=p_emb, inputs_k=f_emb, inputs_v=f_emb, mask=attn_bias)
-        p_emb = self.rezero(p_emb, ca_out)
-        return self.rezero(p_emb, self.ffn(p_emb))
+        ca_out = self.cross_attn(inputs_q=self.norm1(p_emb), inputs_k=f_emb, inputs_v=f_emb, mask=attn_bias)
+        p_emb = p_emb + ca_out
+        return p_emb + self.ffn(self.norm2(p_emb))
 
 
 class PlanetSelfAttentionBlock(nnx.Module):
@@ -164,7 +162,8 @@ class PlanetSelfAttentionBlock(nnx.Module):
             rngs=rngs,
             decode=False
         )
-        self.rezero = ReZero(rngs=rngs)
+        self.norm1 = nnx.LayerNorm(hidden_dim, rngs=rngs)
+        self.norm2 = nnx.LayerNorm(hidden_dim, rngs=rngs)
         self.rel_bias_mlp = nnx.Sequential(
             nnx.Linear(3, 16, rngs=rngs),
             jax.nn.silu,
@@ -185,9 +184,9 @@ class PlanetSelfAttentionBlock(nnx.Module):
         if planet_mask is not None:
             attn_bias = jnp.where(planet_mask[..., None, None, :], attn_bias, -1e9)
 
-        sa_out = self.self_attn(inputs_q=p_emb, mask=attn_bias)
-        p_emb = self.rezero(p_emb, sa_out)
-        return self.rezero(p_emb, self.ffn(p_emb))
+        sa_out = self.self_attn(inputs_q=self.norm1(p_emb), mask=attn_bias)
+        p_emb = p_emb + sa_out
+        return p_emb + self.ffn(self.norm2(p_emb))
 
 
 class Actor(nnx.Module):
@@ -199,6 +198,7 @@ class Actor(nnx.Module):
             setattr(self, f'sa_block_{i}', PlanetSelfAttentionBlock(hidden_dim, rngs=rngs))
         self.ca_block_1 = PlanetMidCrossAttentionBlock(hidden_dim, rngs=rngs)
 
+        self.final_norm = nnx.LayerNorm(hidden_dim, rngs=rngs)
         self.q_action = nnx.Linear(hidden_dim, hidden_dim, rngs=rngs)
         self.k_action = nnx.Linear(hidden_dim, hidden_dim, rngs=rngs)
         self.deep_space_prob = nnx.Linear(hidden_dim, 4, rngs=rngs)
@@ -220,6 +220,7 @@ class Actor(nnx.Module):
         for i in range(mid, self.num_sa_layers):
             p_emb = getattr(self, f'sa_block_{i}')(p_emb, p_coords, planet_mask=planet_mask)
 
+        p_emb = self.final_norm(p_emb)
         planetary_logits = jnp.einsum('...id,...jd->...ij', self.q_action(p_emb), self.k_action(p_emb))
 
         # +1.0 exploration bias keeps deep space competitive against 60 planet logits
@@ -255,7 +256,7 @@ class Critic(nnx.Module):
             rngs=rngs,
             decode=False
         )
-        self.rezero_global = ReZero(rngs=rngs)
+        self.norm_global = nnx.LayerNorm(hidden_dim, rngs=rngs)
 
         self.value_head = nnx.Sequential(
             nnx.Linear(hidden_dim, hidden_dim, rngs=rngs),
@@ -279,8 +280,8 @@ class Critic(nnx.Module):
         if planet_mask is not None:
             sa_mask = planet_mask[..., None, None, :]
 
-        ga_out = self.global_attn(inputs_q=pa_proj, mask=sa_mask)
-        ga_out = self.rezero_global(pa_proj, ga_out)
+        ga_out = self.global_attn(inputs_q=self.norm_global(pa_proj), mask=sa_mask)
+        ga_out = pa_proj + ga_out
 
         if planet_mask is not None:
             ga_out = jnp.where(planet_mask[..., None], ga_out, 0.0)
@@ -301,20 +302,29 @@ class DoubleCritic(nnx.Module):
         v2 = self.q2(planets, fleets, actions, planet_mask=planet_mask, fleet_mask=fleet_mask)
         return v1, v2
 
-def logits_to_action(raw_actions, current_ships):
+def logits_to_action(raw_actions, current_ships, mask_self=True, include_ds=True):
     """
     raw_actions: [B, 60, 72]  — 64 temperature-scaled softmax logits + 8 ds sin/cos
     current_ships: [B, 60]
+    mask_self: if True, zero out diagonal (planet sending to itself)
+    include_ds: if True, softmax over 64 bins (60 planet + 4 DS); if False, 60 bins only
 
     returns: (ships, angle)
-    ships: [B, 60, 64] - ship allocations per source planet to 60 planet targets + 4 deep space bins
-    angle: [B, 60, 4] - launch angle for the 4 deep space bins, decoded from sin/cos
+    ships: [B, 60, 64] or [B, 60, 60] depending on include_ds
+    angle: [B, 60, 4] - launch angle for the 4 deep space bins
     """
-    logits = raw_actions[..., :64]
-    probs  = jax.nn.softmax(logits, axis=-1)
-
-    ships = probs * current_ships[..., None]
-    ships = ships * _SELF_TARGET_MASK
+    if include_ds:
+        logits = raw_actions[..., :64]
+        probs  = jax.nn.softmax(logits, axis=-1)
+        ships  = probs * current_ships[..., None]
+        if mask_self:
+            ships = ships * _SELF_TARGET_MASK
+    else:
+        logits = raw_actions[..., :60]
+        probs  = jax.nn.softmax(logits, axis=-1)
+        ships  = probs * current_ships[..., None]
+        if mask_self:
+            ships = ships * _SELF_TARGET_MASK_60
 
     ds_sincos = raw_actions[..., 64:72]
     ds_angle  = jnp.arctan2(ds_sincos[..., :4], ds_sincos[..., 4:])

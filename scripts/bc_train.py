@@ -1,11 +1,20 @@
 """
-Behavioral Cloning from leaderboard replay data.
+Behavioral Cloning from leaderboard replay data (v13.1).
 
 Usage:
   uv run python scripts/bc_train.py --preprocess --data-dir /tmp/orbit-wars-parquet
   uv run python scripts/bc_train.py --train --bc-data /tmp/bc_data.npz --out weights_bc.pkl
   uv run python scripts/bc_train.py --pretrain-critic --bc-data /tmp/bc_data.npz
   uv run python scripts/bc_train.py --preprocess --train --pretrain-critic
+
+v13.1 preprocessing changes vs v13:
+  - ALL ticks per player (wait ticks included; diagonal = ships held = fire-control signal)
+  - Enemy encoding: ranked distinct negative values by current ship strength
+  - MAX_FLEET_OBS=128 (no pruning at 64)
+  - top-k default 20, --duel-weight 2 (duels oversampled at training time)
+  - n_players saved per sample for weighted training sampler
+  - On-the-fly 4-fold rotation augmentation during training
+  - Training loss: diagonal included as valid target, has_ships mask replaces has_action
 """
 
 import os, sys, math, pickle, argparse, time, json, subprocess
@@ -40,27 +49,29 @@ parser.add_argument('--data-dir',       default='/tmp/orbit-wars-parquet')
 parser.add_argument('--bc-data',        default='/tmp/bc_data.npz')
 parser.add_argument('--out',            default='/tmp/weights_bc.pkl')
 parser.add_argument('--critic-out',     default='/tmp/weights_bc_critic.pkl')
-parser.add_argument('--top-k',          type=int,   default=10)
+parser.add_argument('--top-k',          type=int,   default=20)
 parser.add_argument('--min-games',      type=int,   default=20)
+parser.add_argument('--duel-weight',    type=int,   default=2,
+                    help='Oversample 2-player games by this factor at training time')
 parser.add_argument('--epochs',         type=int,   default=50)
 parser.add_argument('--critic-epochs',  type=int,   default=30)
 parser.add_argument('--batch-size',     type=int,   default=512)
-parser.add_argument('--lr',             type=float, default=1.6e-2)
+parser.add_argument('--lr',             type=float, default=3e-4)
 parser.add_argument('--weight-decay',   type=float, default=0.0)
 parser.add_argument('--gamma',          type=float, default=0.99,
                     help='Discount factor for Monte Carlo returns in critic pretraining')
 parser.add_argument('--val-frac',       type=float, default=0.1,
                     help='Fraction of data held out for validation loss tracking')
-parser.add_argument('--warmup-epochs',  type=int,   default=0,
-                    help='Linear LR warmup epochs (0 = no warmup, fixed LR from step 1 per ReZero paper)')
-parser.add_argument('--alpha-lr-scale', type=float, default=0.08,
-                    help='ReZero α LR as fraction of peak --lr; kept constant throughout (paper §E.2)')
+parser.add_argument('--warmup-epochs',  type=int,   default=5,
+                    help='Linear LR warmup epochs')
 parser.add_argument('--resume',         action='store_true',
                     help='Resume from local checkpoint saved alongside --out')
 parser.add_argument('--checkpoint-every',type=int,   default=30,
                     help='Upload BC weights to R2 every N epochs (0 = disabled)')
-parser.add_argument('--r2-prefix',       type=str,   default='bc_v9',
-                    help='R2 key prefix for checkpoint uploads (e.g. bc_v9)')
+parser.add_argument('--r2-prefix',       type=str,   default='bc_v13_1',
+                    help='R2 key prefix for checkpoint uploads')
+parser.add_argument('--transfer-from',   type=str,   default='',
+                    help='Path to v13 weights.pkl to warm-start from (reinits action head + fleet MLPs)')
 parser.add_argument('--eval-every',     type=int,   default=1,
                     help='Run val loss every N epochs (set >1 to save compute)')
 args = parser.parse_args()
@@ -68,76 +79,18 @@ args = parser.parse_args()
 HIDDEN_DIM    = 48
 NUM_SA_LAYERS = 6
 SHIP_SPEED    = 6.0
-MAX_FLEET_OBS = 64
+MAX_FLEET_OBS = 128
 
 # ---------------------------------------------------------------------------
 # ReZero alpha logging — all scalars (ndim==0) in the params pytree are alphas;
 # every other param in this architecture is at least 1-D.
 # Logs each layer by name plus a summary line.
 # ---------------------------------------------------------------------------
-def _parse_rezero(params):
-    """Return list of (name, value) for all ReZero alpha scalars."""
-    import jax
-    named = []
-    for path, leaf in jax.tree_util.tree_leaves_with_path(params):
-        if not (hasattr(leaf, 'shape') and leaf.ndim == 0):
-            continue
-        parts = []
-        for key in path:
-            s = str(key)
-            for wrapper in ("DictKey(key='", "DictKey('", "FlattenedIndexKey(",
-                            "SequenceKey(idx=", "GetitemKey(key="):
-                if s.startswith(wrapper):
-                    s = s[len(wrapper):].rstrip(")'")
-                    break
-            parts.append(s)
-        named.append(('.'.join(parts), float(leaf)))
-    return named
-
-
 def _rezero_summary(params) -> str:
-    """Compact one-line ReZero summary: one α per block, grouped by CA vs SA."""
-    named = _parse_rezero(params)
-    if not named:
-        return ''
-
-    groups = {'ca': [], 'sa': []}
-    for name, v in named:
-        if 'ca_block' in name or 'cross_attention_block' in name:
-            groups['ca'].append(v)
-        else:
-            groups['sa'].append(v)
-
-    def fmt(vals):
-        if not vals:
-            return '—'
-        if len(vals) == 1:
-            return f'{vals[0]:+.3f}'
-        a = np.array(vals)
-        return f'{a.mean():+.3f}±{a.std():.3f}'
-
-    all_vals = np.array([v for _, v in named])
-    threshold = 0.1 * np.abs(all_vals).max() if np.abs(all_vals).max() > 0 else 0.01
-    dead = (np.abs(all_vals) < threshold).sum()
-    return (f"α dead={dead}/{len(named)} "
-            f"ca={fmt(groups['ca'])} sa={fmt(groups['sa'])}")
-
+    return ''
 
 def _log_rezero(params, label: str = ''):
-    """Full per-layer ReZero log with bar chart (used every 10 epochs)."""
-    named = _parse_rezero(params)
-    if not named:
-        return
-    tag = f"[{label}] " if label else ""
-    vals = np.array([v for _, v in named])
-    threshold = 0.1 * np.abs(vals).max() if np.abs(vals).max() > 0 else 0.01
-    dead = (np.abs(vals) < threshold).sum()
-    print(f"  {tag}ReZero α  dead={dead}/{len(vals)}  "
-          f"mean={vals.mean():.4f}  max={vals.max():.4f}")
-    for name, v in named:
-        bar = '█' * (int(min(abs(v) * 200, 30)) if math.isfinite(v) else 0)
-        sign = '+' if v >= 0 else '-'
-        print(f"    {name:<55s} {sign}{abs(v):.5f}  {bar}")
+    pass
 
 
 def _upload_to_r2(*local_paths, prefix='bc'):
@@ -281,10 +234,15 @@ def preprocess():
     print(f"  {len(ps_dict):,} (episode, tick) groups in {time.time()-t1:.1f}s")
 
     # Episode max tick (for computing discounted returns)
+    # Also build all_ticks_by_ep so we can iterate ALL ticks per episode (not just action ticks)
     max_tick_by_ep = {}
+    all_ticks_by_ep = {}
     for (eid, tick) in ps_dict:
         if eid not in max_tick_by_ep or tick > max_tick_by_ep[eid]:
             max_tick_by_ep[eid] = tick
+        all_ticks_by_ep.setdefault(eid, []).append(tick)
+    for eid in all_ticks_by_ep:
+        all_ticks_by_ep[eid].sort()
 
     # Outcome lookup: (episode_id, slot) → is_winner float
     outcome_lookup = {
@@ -374,7 +332,7 @@ def preprocess():
     n_launches = sum(len(v) for v in fleet_arrays_by_ep.values())
     print(f"  {n_launches:,} fleet launches indexed in {time.time()-t_fleet:.1f}s")
 
-    # Main loop — vectorised per tick
+    # Main loop — ALL ticks per player (including wait ticks)
     print("Processing ticks (vectorised)...")
     t3 = time.time()
     all_planet_obs   = []
@@ -383,20 +341,19 @@ def preprocess():
     all_returns      = []
     all_fleet_obs    = []
     all_fleet_mask   = []
+    all_n_players    = []
     processed_ticks  = 0
 
     for eid, slot, n_p in top_pe.select(['episode_id', 'slot', 'n_players']).iter_rows():
         ep_slot = (eid, int(slot))
-        if ep_slot not in tick_index:
-            continue
 
         theta = -slot * (2.0 * math.pi / n_p)
         cos_t, sin_t = math.cos(theta), math.sin(theta)
 
-        outcome   = outcome_lookup.get(ep_slot, 0.0)
-        max_tick  = max_tick_by_ep.get(eid, 400)
+        outcome  = outcome_lookup.get(ep_slot, 0.0)
+        max_tick = max_tick_by_ep.get(eid, 400)
 
-        for tick in tick_index[ep_slot]:
+        for tick in all_ticks_by_ep.get(eid, []):
             if (eid, tick) not in ps_dict:
                 continue
 
@@ -405,13 +362,29 @@ def preprocess():
             if n_pl == 0:
                 continue
 
+            owned_mask = owners == slot
+            if not owned_mask.any():
+                continue  # player eliminated this tick
+            owned_slots_arr = np.where(owned_mask)[0]
+
+            # Enemy encoding: rank enemies by current ship count (strongest → -1.0)
+            enemy_players = sorted(set(int(o) for o in owners if o >= 0 and o != slot))
+            enemy_ships_total = [(p, float(ships_arr[owners == p].sum())) for p in enemy_players]
+            enemy_ships_total.sort(key=lambda x: -x[1])
+            k = len(enemy_ships_total)
+            enemy_rel_map = {p: -(k - rank) / k for rank, (p, _) in enumerate(enemy_ships_total)}
+
             # Planet obs — vectorised
             slots_arr = np.arange(n_pl)
             dx = xs - 50.0;  dy = ys - 50.0
             rot_x = dx * cos_t - dy * sin_t + 50.0
             rot_y = dx * sin_t + dy * cos_t + 50.0
-            rel_owners = np.where(owners == slot, 1.0,
-                         np.where(owners < 0,    0.0, -1.0)).astype(np.float32)
+
+            rel_owners = np.zeros(n_pl, dtype=np.float32)
+            rel_owners[owners == slot] = 1.0
+            for ep, rel_val in enemy_rel_map.items():
+                rel_owners[owners == ep] = rel_val
+            # neutral (owner < 0) stays 0.0
 
             p_arr = np.zeros((60, 7), dtype=np.float32)
             p_arr[slots_arr, 0] = slots_arr.astype(np.float32)
@@ -422,45 +395,44 @@ def preprocess():
             p_arr[slots_arr, 5] = ships_arr
             p_arr[slots_arr, 6] = prods
 
-            owned_mask = owners == slot
-            if not owned_mask.any():
-                continue
-            owned_slots_arr = slots_arr[owned_mask]
-
-            src_pids_act, angles_act, nships_act = acts_dict[(eid, slot, tick)]
-            pid_to_idx = {int(p): i for i, p in enumerate(pids)}
-            src_idxs = np.fromiter(
-                (pid_to_idx.get(int(p), -1) for p in src_pids_act),
-                dtype=np.int32, count=len(src_pids_act)
-            )
-
-            valid = (src_idxs >= 0) & np.isin(src_idxs, owned_slots_arr)
-            if not valid.any():
-                continue
-
-            src_v    = src_idxs[valid]
-            angles_v = angles_act[valid]
-            nships_v = nships_act[valid]
-
-            tgt_slots = _classify_batch(
-                xs[src_v], ys[src_v], angles_v,
-                xs[:n_pl], ys[:n_pl], radii[:n_pl], src_v
-            )
-
-            hit_mask = tgt_slots >= 0
-            if not hit_mask.any():
-                continue
-
+            # ships_target: off-diagonal from ray-cast actions, diagonal = ships held
             ships_target = np.zeros((60, 60), dtype=np.float32)
-            np.add.at(ships_target, (src_v[hit_mask], tgt_slots[hit_mask]), nships_v[hit_mask])
 
-            if ships_target.sum() == 0:
+            if (eid, slot, tick) in acts_dict:
+                src_pids_act, angles_act, nships_act = acts_dict[(eid, slot, tick)]
+                pid_to_idx = {int(p): i for i, p in enumerate(pids)}
+                src_idxs = np.fromiter(
+                    (pid_to_idx.get(int(p), -1) for p in src_pids_act),
+                    dtype=np.int32, count=len(src_pids_act)
+                )
+                valid = (src_idxs >= 0) & np.isin(src_idxs, owned_slots_arr)
+                if valid.any():
+                    src_v    = src_idxs[valid]
+                    angles_v = angles_act[valid]
+                    nships_v = nships_act[valid]
+                    tgt_slots = _classify_batch(
+                        xs[src_v], ys[src_v], angles_v,
+                        xs[:n_pl], ys[:n_pl], radii[:n_pl], src_v
+                    )
+                    hit_mask = tgt_slots >= 0
+                    if hit_mask.any():
+                        np.add.at(ships_target,
+                                  (src_v[hit_mask], tgt_slots[hit_mask]),
+                                  nships_v[hit_mask])
+
+            # Fill diagonal: ships held = ships at planet − ships launched from it
+            for i in owned_slots_arr:
+                launched = float(ships_target[i, :].sum())
+                held = max(float(ships_arr[i]) - launched, 0.0)
+                ships_target[i, i] = held
+
+            # Skip if owned planets have no ships at all (e.g., just captured, 0 ships)
+            if ships_target[owned_slots_arr, :].sum() == 0:
                 continue
 
-            owner_mask = np.zeros(60, dtype=bool)
-            owner_mask[owned_slots_arr] = True
+            owner_mask_out = np.zeros(60, dtype=bool)
+            owner_mask_out[owned_slots_arr] = True
 
-            # Monte Carlo return: γ^(T-t) * outcome
             ret = (args.gamma ** (max_tick - tick)) * outcome
 
             # Fleet obs — in-transit fleets at this tick across all players
@@ -475,13 +447,18 @@ def preprocess():
                 if K > 0:
                     dt    = tick - in_t[:, 0]
                     speed = _fleet_speed_batch(in_t[:, 6])
-                    # Start from planet surface (launch_x/y are planet centers)
                     r_src = in_t[:, 7]
                     cx    = in_t[:, 3] + np.cos(in_t[:, 5]) * (r_src + speed * dt)
                     cy    = in_t[:, 4] + np.sin(in_t[:, 5]) * (r_src + speed * dt)
                     fdx   = cx - 50.0;  fdy = cy - 50.0
+                    # Fleet enemy encoding: same ranked scheme as planets
+                    fleet_owner_slots = in_t[:, 2].astype(np.int32)
+                    fleet_rel = np.zeros(K, dtype=np.float32)
+                    fleet_rel[fleet_owner_slots == slot] = 1.0
+                    for ep, rel_val in enemy_rel_map.items():
+                        fleet_rel[fleet_owner_slots == ep] = rel_val
                     fleet_arr[:K, 0] = np.arange(K, dtype=np.float32)
-                    fleet_arr[:K, 1] = np.where(in_t[:, 2] == slot, 1.0, -1.0)
+                    fleet_arr[:K, 1] = fleet_rel
                     fleet_arr[:K, 2] = in_t[:, 5] + theta
                     fleet_arr[:K, 3] = fdx * cos_t - fdy * sin_t + 50.0
                     fleet_arr[:K, 4] = fdx * sin_t + fdy * cos_t + 50.0
@@ -490,10 +467,11 @@ def preprocess():
 
             all_planet_obs.append(p_arr.astype(np.float16))
             all_ships_target.append(ships_target.astype(np.float16))
-            all_owner_mask.append(owner_mask)
+            all_owner_mask.append(owner_mask_out)
             all_returns.append(np.float32(ret))
             all_fleet_obs.append(fleet_arr.astype(np.float16))
             all_fleet_mask.append(fleet_mask_arr)
+            all_n_players.append(np.int8(n_p))
             processed_ticks += 1
 
             if processed_ticks % 50_000 == 0 and processed_ticks > 0:
@@ -507,10 +485,19 @@ def preprocess():
     returns_arr      = np.array(all_returns,      dtype=np.float32)
     fleet_obs_arr    = np.stack(all_fleet_obs,    axis=0)
     fleet_mask_arr   = np.stack(all_fleet_mask,   axis=0)
+    n_players_arr    = np.array(all_n_players,    dtype=np.int8)
 
     active_fleets = fleet_mask_arr.sum(axis=1)
     print(f"  Fleet obs: mean={active_fleets.mean():.1f}  max={active_fleets.max()}  "
-          f"zero={( active_fleets==0).sum()} ticks with no fleets")
+          f"  capped (={MAX_FLEET_OBS}): {(active_fleets==MAX_FLEET_OBS).sum()} ticks")
+    duels = (n_players_arr == 2).sum()
+    print(f"  n_players: {duels:,} duel ticks / {processed_ticks - duels:,} FFA ticks")
+
+    # Diagonal coverage (fraction of owned planets with non-zero hold signal)
+    diag = np.array([ships_target_arr[:, i, i] for i in range(60)]).T
+    own  = owner_mask_arr
+    held_frac = (diag[own] > 0).mean()
+    print(f"  Hold signal (diagonal): {held_frac*100:.1f}% of owned planet slots are non-zero")
 
     print(f"Saving to {args.bc_data}...")
     np.savez_compressed(
@@ -521,17 +508,18 @@ def preprocess():
         returns=returns_arr,
         fleet_obs=fleet_obs_arr,
         fleet_mask=fleet_mask_arr,
+        n_players=n_players_arr,
     )
     size_mb = os.path.getsize(args.bc_data) / 1e6
     print(f"Saved {args.bc_data} ({size_mb:.1f} MB)")
-    return planet_obs_arr, ships_target_arr, owner_mask_arr, returns_arr, fleet_obs_arr, fleet_mask_arr
+    return planet_obs_arr, ships_target_arr, owner_mask_arr, returns_arr, fleet_obs_arr, fleet_mask_arr, n_players_arr
 
 
 # ---------------------------------------------------------------------------
 # TRAIN ACTOR (BC)
 # ---------------------------------------------------------------------------
 def train(planet_obs=None, ships_target=None, owner_mask=None, returns=None,
-          fleet_obs=None, fleet_mask=None):
+          fleet_obs=None, fleet_mask=None, n_players=None):
     import jax
     import jax.numpy as jnp
     import optax
@@ -544,6 +532,7 @@ def train(planet_obs=None, ships_target=None, owner_mask=None, returns=None,
         planet_obs   = data['planet_obs'].astype(np.float32)
         ships_target = data['ships_target'].astype(np.float32)
         owner_mask   = data['owner_mask']
+        n_players    = data['n_players'] if 'n_players' in data else None
         if 'fleet_obs' in data:
             fleet_obs  = data['fleet_obs'].astype(np.float32)
             fleet_mask = data['fleet_mask']
@@ -552,30 +541,75 @@ def train(planet_obs=None, ships_target=None, owner_mask=None, returns=None,
     if fleet_obs is None:
         fleet_obs  = np.zeros((N, MAX_FLEET_OBS, 6), dtype=np.float32)
         fleet_mask = np.zeros((N, MAX_FLEET_OBS),    dtype=bool)
+
     rng = np.random.default_rng(42)
-    perm = rng.permutation(N)
-    n_val      = max(1, int(N * args.val_frac))
-    val_idx    = perm[:n_val]
-    train_idx  = perm[n_val:]
-    N_train    = len(train_idx)
-    print(f"Training actor on {N_train:,} train / {n_val:,} val ticks | "
+    perm   = rng.permutation(N)
+    n_val  = max(1, int(N * args.val_frac))
+    val_idx   = perm[:n_val]
+    train_idx = perm[n_val:]
+    N_train   = len(train_idx)
+
+    # Build weighted train index: duel samples repeated duel_weight times
+    if n_players is not None and args.duel_weight > 1:
+        is_duel = n_players[train_idx] == 2
+        duel_extra = np.tile(train_idx[is_duel], args.duel_weight - 1)
+        train_idx_w = np.concatenate([train_idx, duel_extra])
+        print(f"  Duel weighting: {is_duel.sum():,} duel → ×{args.duel_weight} "
+              f"→ effective train size {len(train_idx_w):,}")
+    else:
+        train_idx_w = train_idx
+    N_train_w = len(train_idx_w)
+
+    print(f"Training actor on {N_train:,} train / {n_val:,} val ticks "
+          f"(effective {N_train_w:,} with duel weighting) | "
           f"batch={args.batch_size} | epochs={args.epochs} | wd={args.weight_decay}")
 
     actor = Actor(hidden_dim=HIDDEN_DIM, num_sa_layers=NUM_SA_LAYERS, rngs=nnx.Rngs(0))
     actor_graph, params = nnx.split(actor)
 
-    steps_per_epoch = N_train // args.batch_size
-    alpha_lr = args.lr * args.alpha_lr_scale
+    # Transfer learning: load v13 weights, reinit action head + fleet MLPs
+    if args.transfer_from:
+        print(f"Transfer learning from {args.transfer_from}...")
+        import pickle as _pkl
+        with open(args.transfer_from, 'rb') as _f:
+            _src = _pkl.load(_f)
+        _src_jax = jax.tree_util.tree_map(jnp.array, _src)
 
-    # Fixed LR throughout — ReZero paper (Appendix B) uses no schedule with LAMB.
-    # α gets a separate constant LR (paper §E.2: residual weights need stable LR).
-    main_opt  = optax.lamb(learning_rate=args.lr, weight_decay=args.weight_decay)
-    alpha_opt = optax.adam(learning_rate=alpha_lr)
+        # Flat-key transfer via jax pytree paths
+        src_leaves, src_tdef = jax.tree_util.tree_flatten_with_path(_src_jax)
+        dst_leaves, dst_tdef = jax.tree_util.tree_flatten_with_path(params)
+        REINIT_SUBSTRINGS = [
+            'q_action', 'k_action', 'temperature_head',
+            'deep_space_prob', 'deep_space_sincos',
+            'ca_block_0.fleet_mlp', 'ca_block_0.planet_mlp', 'ca_block_0.rel_bias_mlp',
+            'ca_block_1.fleet_mlp', 'ca_block_1.rel_bias_mlp',
+        ]
+        new_leaves = []
+        transferred, reinitialized = 0, 0
+        for (dst_path, dst_leaf), (_, src_leaf) in zip(dst_leaves, src_leaves):
+            path_str = '.'.join(
+                str(k.key if hasattr(k, 'key') else k) for k in dst_path
+            )
+            if any(sub in path_str for sub in REINIT_SUBSTRINGS):
+                new_leaves.append(dst_leaf)  # keep fresh init
+                reinitialized += 1
+            else:
+                new_leaves.append(src_leaf)  # transfer from v13
+                transferred += 1
+        params = jax.tree_util.tree_unflatten(dst_tdef, new_leaves)
+        print(f"  Transferred {transferred} / reinitialized {reinitialized} parameter leaves")
 
-    def _param_labels(p):
-        return jax.tree_util.tree_map(lambda x: 'alpha' if x.ndim == 0 else 'main', p)
+    steps_per_epoch = N_train_w // args.batch_size
+    warmup_steps    = args.warmup_epochs * steps_per_epoch
 
-    opt       = optax.multi_transform({'main': main_opt, 'alpha': alpha_opt}, _param_labels)
+    schedule = optax.join_schedules(
+        schedules=[
+            optax.linear_schedule(0.0, args.lr, max(warmup_steps, 1)),
+            optax.constant_schedule(args.lr),
+        ],
+        boundaries=[warmup_steps],
+    )
+    opt       = optax.contrib.muon(learning_rate=schedule, weight_decay=args.weight_decay)
     opt_state = opt.init(params)
 
     resume_path = args.out.replace('.pkl', '_resume.pkl')
@@ -594,20 +628,54 @@ def train(planet_obs=None, ships_target=None, owner_mask=None, returns=None,
         opt_state   = jax.tree_util.tree_map(jnp.array, ckpt['opt_state'])
         print(f"  Resumed at epoch {start_epoch} | best_val={best_val:.4f}")
 
+    def _rotate_batch(planets_b, fleets_b, k):
+        """Apply k*90° rotation (0=identity, 1=90°, 2=180°, 3=270°). Pure JAX — no Python branches."""
+        angle = k * jnp.pi / 2.0
+        c, s = jnp.cos(angle), jnp.sin(angle)
+
+        # Planet: cols 2,3 = rot_x, rot_y
+        px = planets_b[..., 2] - 50.0
+        py = planets_b[..., 3] - 50.0
+        planets_r = jnp.concatenate([
+            planets_b[..., :2],
+            (px * c - py * s + 50.0)[..., None],
+            (px * s + py * c + 50.0)[..., None],
+            planets_b[..., 4:],
+        ], axis=-1)
+
+        # Fleet: col 2 = angle, cols 3,4 = rot_x, rot_y
+        fx = fleets_b[..., 3] - 50.0
+        fy = fleets_b[..., 4] - 50.0
+        fleets_r = jnp.concatenate([
+            fleets_b[..., :2],
+            (fleets_b[..., 2] + angle)[..., None],
+            (fx * c - fy * s + 50.0)[..., None],
+            (fx * s + fy * c + 50.0)[..., None],
+            fleets_b[..., 5:],
+        ], axis=-1)
+
+        return planets_r, fleets_r
+
     def _xent(planets_b, ships_tgt_b, owner_mask_b, fleets_b, fmask_b, actor_inst):
-        pmask       = planets_b[..., 4] > 0   # radius > 0 — excludes zero-padded ghost slots
-        logits      = actor_inst(planets_b, fleets_b, planet_mask=pmask, fleet_mask=fmask_b)
-        total_sent  = ships_tgt_b.sum(axis=-1, keepdims=True)
-        target_dist = ships_tgt_b / (total_sent + 1e-8)
+        pmask = planets_b[..., 4] > 0   # radius > 0 — excludes zero-padded ghost slots
+        logits = actor_inst(planets_b, fleets_b, planet_mask=pmask, fleet_mask=fmask_b)
+        # Diagonal now included as "hold" signal — normalize by total ships per planet
+        total_ships = ships_tgt_b.sum(axis=-1, keepdims=True)
+        target_dist = ships_tgt_b / (total_ships + 1e-8)
         log_probs   = jax.nn.log_softmax(logits[..., :60], axis=-1)
         xent        = -jnp.sum(target_dist * log_probs, axis=-1)
-        has_action  = (total_sent[..., 0] > 0) & owner_mask_b
-        return jnp.sum(xent * has_action) / (jnp.sum(has_action) + 1e-8)
+        # has_ships: owned planets with any ships (diagonal or off-diagonal)
+        has_ships   = (total_ships[..., 0] > 0) & owner_mask_b
+        return jnp.sum(xent * has_ships) / (jnp.sum(has_ships) + 1e-8)
 
     @jax.jit
-    def train_step(params, opt_state, planets_b, ships_tgt_b, owner_mask_b, fleets_b, fmask_b):
+    def train_step(params, opt_state, planets_b, ships_tgt_b, owner_mask_b,
+                   fleets_b, fmask_b, rot_k):
+        # On-the-fly rotation augmentation (rot_k ∈ {0,1,2,3})
+        planets_aug, fleets_aug = _rotate_batch(planets_b, fleets_b, rot_k)
+
         def loss_fn(params):
-            return _xent(planets_b, ships_tgt_b, owner_mask_b, fleets_b, fmask_b,
+            return _xent(planets_aug, ships_tgt_b, owner_mask_b, fleets_aug, fmask_b,
                          nnx.merge(actor_graph, params))
         loss, grads = jax.value_and_grad(loss_fn)(params)
         updates, new_opt_state = opt.update(grads, opt_state, params)
@@ -620,13 +688,14 @@ def train(planet_obs=None, ships_target=None, owner_mask=None, returns=None,
 
     for epoch in range(start_epoch, args.epochs):
         t0 = time.time()
-        shuffled = rng.permutation(N_train)
+        shuffled = rng.permutation(N_train_w)
 
         train_losses = []
-        batch_iter = _bar(range(0, N_train - args.batch_size, args.batch_size),
+        batch_iter = _bar(range(0, N_train_w - args.batch_size, args.batch_size),
                           desc=f'E{epoch+1}/{args.epochs}')
         for start in batch_iter:
-            bi = train_idx[shuffled[start:start + args.batch_size]]
+            bi = train_idx_w[shuffled[start:start + args.batch_size]]
+            rot_k = int(rng.integers(0, 4))
             params, opt_state, loss = train_step(
                 params, opt_state,
                 jnp.array(planet_obs[bi]),
@@ -634,6 +703,7 @@ def train(planet_obs=None, ships_target=None, owner_mask=None, returns=None,
                 jnp.array(owner_mask[bi]),
                 jnp.array(fleet_obs[bi]),
                 jnp.array(fleet_mask[bi]),
+                jnp.array(rot_k),
             )
             loss_val = float(loss)
             train_losses.append(loss_val)
@@ -849,8 +919,9 @@ if __name__ == '__main__':
     if (args.train or args.pretrain_critic) and preprocess_result is None:
         print(f"Loading {args.bc_data}...")
         _d = np.load(args.bc_data)
-        _fo = _d['fleet_obs'].astype(np.float32)  if 'fleet_obs'  in _d else None
-        _fm = _d['fleet_mask']                     if 'fleet_mask' in _d else None
+        _fo  = _d['fleet_obs'].astype(np.float32) if 'fleet_obs'  in _d else None
+        _fm  = _d['fleet_mask']                    if 'fleet_mask' in _d else None
+        _np  = _d['n_players']                     if 'n_players'  in _d else None
         preprocess_result = (
             _d['planet_obs'].astype(np.float32),
             _d['ships_target'].astype(np.float32),
@@ -858,6 +929,7 @@ if __name__ == '__main__':
             _d['returns'].astype(np.float32),
             _fo,
             _fm,
+            _np,
         )
         print(f"  Loaded {len(preprocess_result[0]):,} samples")
 
