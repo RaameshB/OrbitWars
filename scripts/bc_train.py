@@ -53,7 +53,9 @@ parser.add_argument('--gamma',          type=float, default=0.99,
 parser.add_argument('--val-frac',       type=float, default=0.1,
                     help='Fraction of data held out for validation loss tracking')
 parser.add_argument('--warmup-epochs',  type=int,   default=5,
-                    help='Linear LR warmup from lr/10 to lr over this many epochs')
+                    help='Linear LR warmup from lr/100 to lr over this many epochs (one-cycle phase 1)')
+parser.add_argument('--alpha-lr-scale', type=float, default=0.1,
+                    help='ReZero α LR as fraction of peak --lr; kept constant throughout (paper §E.2)')
 parser.add_argument('--resume',         action='store_true',
                     help='Resume from local checkpoint saved alongside --out')
 parser.add_argument('--checkpoint-every',type=int,   default=30,
@@ -95,17 +97,17 @@ def _parse_rezero(params):
 
 
 def _rezero_summary(params) -> str:
-    """Compact one-line ReZero summary differentiating CA / CA-FFN / SA / SA-FFN."""
+    """Compact one-line ReZero summary: one α per block, grouped by CA vs SA."""
     named = _parse_rezero(params)
     if not named:
         return ''
 
-    groups = {'ca': [], 'ca_ffn': [], 'sa': [], 'sa_ffn': []}
+    groups = {'ca': [], 'sa': []}
     for name, v in named:
         if 'ca_block' in name or 'cross_attention_block' in name:
-            groups['ca_ffn' if 'ffn' in name else 'ca'].append(v)
+            groups['ca'].append(v)
         else:
-            groups['sa_ffn' if 'ffn' in name else 'sa'].append(v)
+            groups['sa'].append(v)
 
     def fmt(vals):
         if not vals:
@@ -119,8 +121,7 @@ def _rezero_summary(params) -> str:
     threshold = 0.1 * np.abs(all_vals).max() if np.abs(all_vals).max() > 0 else 0.01
     dead = (np.abs(all_vals) < threshold).sum()
     return (f"α dead={dead}/{len(named)} "
-            f"ca={fmt(groups['ca'])} ca_ffn={fmt(groups['ca_ffn'])} "
-            f"sa={fmt(groups['sa'])} sa_ffn={fmt(groups['sa_ffn'])}")
+            f"ca={fmt(groups['ca'])} sa={fmt(groups['sa'])}")
 
 
 def _log_rezero(params, label: str = ''):
@@ -565,15 +566,28 @@ def train(planet_obs=None, ships_target=None, owner_mask=None, returns=None,
     actor_graph, params = nnx.split(actor)
 
     steps_per_epoch = N_train // args.batch_size
+    total_steps     = steps_per_epoch * args.epochs
     warmup_steps    = args.warmup_epochs * steps_per_epoch
-    schedule = optax.join_schedules(
+    decay_steps     = max(total_steps - warmup_steps, 1)
+    min_lr          = args.lr * 0.01
+    alpha_lr        = args.lr * args.alpha_lr_scale
+
+    # One-cycle schedule for main weights: linear warmup → cosine decay
+    main_schedule = optax.join_schedules(
         schedules=[
-            optax.linear_schedule(args.lr * 0.1, args.lr, warmup_steps),
-            optax.constant_schedule(args.lr),
+            optax.linear_schedule(min_lr, args.lr, warmup_steps),
+            optax.cosine_decay_schedule(args.lr, decay_steps, alpha=min_lr / args.lr),
         ],
         boundaries=[warmup_steps],
     )
-    opt       = optax.adan(learning_rate=schedule, weight_decay=args.weight_decay)
+    # α (ReZero residual weights) get a fixed low LR — they cannot tolerate large LR swings
+    main_opt  = optax.lamb(learning_rate=main_schedule, weight_decay=args.weight_decay)
+    alpha_opt = optax.adam(learning_rate=alpha_lr)
+
+    def _param_labels(p):
+        return jax.tree_util.tree_map(lambda x: 'alpha' if x.ndim == 0 else 'main', p)
+
+    opt       = optax.multi_transform({'main': main_opt, 'alpha': alpha_opt}, _param_labels)
     opt_state = opt.init(params)
 
     resume_path = args.out.replace('.pkl', '_resume.pkl')

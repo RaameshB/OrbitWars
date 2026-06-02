@@ -76,13 +76,12 @@ class PlanetCrossAttentionBlock(nnx.Module):
             rngs=rngs,
             decode=False
         )
-        self.rezero_ca = ReZero(rngs=rngs)
+        self.rezero = ReZero(rngs=rngs)
         self.ffn = nnx.Sequential(
             nnx.Linear(hidden_dim, hidden_dim * 2, rngs=rngs),
             jax.nn.silu,
             nnx.Linear(hidden_dim * 2, hidden_dim, rngs=rngs)
         )
-        self.rezero_ffn = ReZero(rngs=rngs)
 
     def __call__(self, planets, fleets, fleet_mask=None):
         p_coords = planets[..., 2:4]   # [rot_x, rot_y]
@@ -105,8 +104,8 @@ class PlanetCrossAttentionBlock(nnx.Module):
             attn_bias = jnp.where(fleet_mask[..., None, None, :], attn_bias, -1e9)
 
         ca_out = self.cross_attn(inputs_q=p_emb, inputs_k=f_emb, inputs_v=f_emb, mask=attn_bias)
-        p_emb = self.rezero_ca(p_emb, ca_out)
-        return self.rezero_ffn(p_emb, self.ffn(p_emb))
+        p_emb = self.rezero(p_emb, ca_out)
+        return self.rezero(p_emb, self.ffn(p_emb))
 
 
 class PlanetMidCrossAttentionBlock(nnx.Module):
@@ -130,13 +129,12 @@ class PlanetMidCrossAttentionBlock(nnx.Module):
             rngs=rngs,
             decode=False
         )
-        self.rezero_ca = ReZero(rngs=rngs)
+        self.rezero = ReZero(rngs=rngs)
         self.ffn = nnx.Sequential(
             nnx.Linear(hidden_dim, hidden_dim * 2, rngs=rngs),
             jax.nn.silu,
             nnx.Linear(hidden_dim * 2, hidden_dim, rngs=rngs)
         )
-        self.rezero_ffn = ReZero(rngs=rngs)
 
     def __call__(self, p_emb, fleets, p_coords, fleet_mask=None):
         f_coords = fleets[..., 3:5]   # [rot_x, rot_y]
@@ -152,8 +150,8 @@ class PlanetMidCrossAttentionBlock(nnx.Module):
             attn_bias = jnp.where(fleet_mask[..., None, None, :], attn_bias, -1e9)
 
         ca_out = self.cross_attn(inputs_q=p_emb, inputs_k=f_emb, inputs_v=f_emb, mask=attn_bias)
-        p_emb = self.rezero_ca(p_emb, ca_out)
-        return self.rezero_ffn(p_emb, self.ffn(p_emb))
+        p_emb = self.rezero(p_emb, ca_out)
+        return self.rezero(p_emb, self.ffn(p_emb))
 
 
 class PlanetSelfAttentionBlock(nnx.Module):
@@ -166,7 +164,7 @@ class PlanetSelfAttentionBlock(nnx.Module):
             rngs=rngs,
             decode=False
         )
-        self.rezero_sa = ReZero(rngs=rngs)
+        self.rezero = ReZero(rngs=rngs)
         self.rel_bias_mlp = nnx.Sequential(
             nnx.Linear(3, 16, rngs=rngs),
             jax.nn.silu,
@@ -177,7 +175,6 @@ class PlanetSelfAttentionBlock(nnx.Module):
             jax.nn.silu,
             nnx.Linear(hidden_dim * 2, hidden_dim, rngs=rngs)
         )
-        self.rezero_ffn = ReZero(rngs=rngs)
 
     def __call__(self, p_emb, p_coords, planet_mask=None):
 
@@ -189,8 +186,8 @@ class PlanetSelfAttentionBlock(nnx.Module):
             attn_bias = jnp.where(planet_mask[..., None, None, :], attn_bias, -1e9)
 
         sa_out = self.self_attn(inputs_q=p_emb, mask=attn_bias)
-        p_emb = self.rezero_sa(p_emb, sa_out)
-        return self.rezero_ffn(p_emb, self.ffn(p_emb))
+        p_emb = self.rezero(p_emb, sa_out)
+        return self.rezero(p_emb, self.ffn(p_emb))
 
 
 class Actor(nnx.Module):
@@ -223,8 +220,7 @@ class Actor(nnx.Module):
         for i in range(mid, self.num_sa_layers):
             p_emb = getattr(self, f'sa_block_{i}')(p_emb, p_coords, planet_mask=planet_mask)
 
-        scale = p_emb.shape[-1] ** 0.5
-        planetary_logits = jnp.einsum('...id,...jd->...ij', self.q_action(p_emb), self.k_action(p_emb)) / scale
+        planetary_logits = jnp.einsum('...id,...jd->...ij', self.q_action(p_emb), self.k_action(p_emb))
 
         # +1.0 exploration bias keeps deep space competitive against 60 planet logits
         ds_prob   = self.deep_space_prob(p_emb) + 1.0
