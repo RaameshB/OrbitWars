@@ -45,15 +45,15 @@ parser.add_argument('--min-games',      type=int,   default=20)
 parser.add_argument('--epochs',         type=int,   default=50)
 parser.add_argument('--critic-epochs',  type=int,   default=30)
 parser.add_argument('--batch-size',     type=int,   default=512)
-parser.add_argument('--lr',             type=float, default=1e-2)
-parser.add_argument('--weight-decay',   type=float, default=1e-2)
+parser.add_argument('--lr',             type=float, default=1e-1)
+parser.add_argument('--weight-decay',   type=float, default=2e-4)
 parser.add_argument('--gamma',          type=float, default=0.99,
                     help='Discount factor for Monte Carlo returns in critic pretraining')
 parser.add_argument('--val-frac',       type=float, default=0.1,
                     help='Fraction of data held out for validation loss tracking')
-parser.add_argument('--warmup-epochs',  type=int,   default=5,
+parser.add_argument('--warmup-epochs',  type=int,   default=30,
                     help='Linear LR warmup from lr/100 to lr over this many epochs (one-cycle phase 1)')
-parser.add_argument('--alpha-lr-scale', type=float, default=0.1,
+parser.add_argument('--alpha-lr-scale', type=float, default=0.08,
                     help='ReZero α LR as fraction of peak --lr; kept constant throughout (paper §E.2)')
 parser.add_argument('--resume',         action='store_true',
                     help='Resume from local checkpoint saved alongside --out')
@@ -565,16 +565,17 @@ def train(planet_obs=None, ships_target=None, owner_mask=None, returns=None,
     actor_graph, params = nnx.split(actor)
 
     steps_per_epoch = N_train // args.batch_size
+    total_steps     = steps_per_epoch * args.epochs
     warmup_steps    = args.warmup_epochs * steps_per_epoch
     min_lr          = args.lr * 0.01
     alpha_lr        = args.lr * args.alpha_lr_scale
 
-    # Warmup → constant: linear ramp to peak LR, then hold for the rest of training
-    # (cosine decay would suppress the sustained high-LR phase needed for late generalization)
+    # One-cycle: linear warmup to peak, cosine decay back to min (Smith 2019 / ReZero §E.2)
+    decay_steps = max(total_steps - warmup_steps, 1)
     main_schedule = optax.join_schedules(
         schedules=[
             optax.linear_schedule(min_lr, args.lr, warmup_steps),
-            optax.constant_schedule(args.lr),
+            optax.cosine_decay_schedule(args.lr, decay_steps, alpha=min_lr / args.lr),
         ],
         boundaries=[warmup_steps],
     )
