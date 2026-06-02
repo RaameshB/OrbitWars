@@ -573,7 +573,7 @@ def train(planet_obs=None, ships_target=None, owner_mask=None, returns=None,
         ],
         boundaries=[warmup_steps],
     )
-    opt       = optax.contrib.adan(learning_rate=schedule, weight_decay=args.weight_decay)
+    opt       = optax.adan(learning_rate=schedule, weight_decay=args.weight_decay)
     opt_state = opt.init(params)
 
     resume_path = args.out.replace('.pkl', '_resume.pkl')
