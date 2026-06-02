@@ -44,8 +44,8 @@ parser.add_argument('--top-k',          type=int,   default=10)
 parser.add_argument('--min-games',      type=int,   default=20)
 parser.add_argument('--epochs',         type=int,   default=50)
 parser.add_argument('--critic-epochs',  type=int,   default=30)
-parser.add_argument('--batch-size',     type=int,   default=256)
-parser.add_argument('--lr',             type=float, default=3e-4)
+parser.add_argument('--batch-size',     type=int,   default=1024)
+parser.add_argument('--lr',             type=float, default=1e-3)
 parser.add_argument('--weight-decay',   type=float, default=1e-2,
                     help='AdamW weight decay (grokking-inspired; applied to 1D params via Muon)')
 parser.add_argument('--gamma',          type=float, default=0.99,
@@ -62,7 +62,7 @@ parser.add_argument('--eval-every',     type=int,   default=1,
                     help='Run val loss every N epochs (set >1 to save compute)')
 args = parser.parse_args()
 
-HIDDEN_DIM    = 32
+HIDDEN_DIM    = 48
 NUM_SA_LAYERS = 6
 SHIP_SPEED    = 6.0
 MAX_FLEET_OBS = 64
@@ -169,7 +169,8 @@ def _upload_to_r2(*local_paths, prefix='bc'):
 # Fleet speed formula — matches orbit_wars_jax.py line 730 exactly
 # ---------------------------------------------------------------------------
 def _fleet_speed_batch(n_ships_arr):
-    n = np.maximum(np.asarray(n_ships_arr, dtype=np.float32), 1.0)
+    # Truncate to int before speed formula — matches game's int-cast behaviour
+    n = np.maximum(np.floor(np.asarray(n_ships_arr, dtype=np.float32)), 1.0)
     raw = 1.0 + (SHIP_SPEED - 1.0) * (np.log(n) / np.log(1000.0)) ** 1.5
     return np.minimum(raw, SHIP_SPEED)
 
@@ -351,15 +352,18 @@ def preprocess():
         if not hit.any():
             continue
         sv, av, nv, tv = sv[hit], av[hit], nv[hit], tgt_slots[hit]
-        dist  = np.sqrt((xs[sv]-xs[tv])**2 + (ys[sv]-ys[tv])**2) - radii[tv]
+        # Subtract both radii: fleet travels from source surface to target surface
+        dist  = np.sqrt((xs[sv]-xs[tv])**2 + (ys[sv]-ys[tv])**2) - radii[sv] - radii[tv]
         speed = _fleet_speed_batch(nv)
-        arr_dt = (np.ceil(np.maximum(dist, 0.0) / speed) + 2).astype(np.int32)
+        arr_dt = (np.ceil(np.maximum(dist, 0.0) / speed) + 1).astype(np.int32)
         if eid not in _ep_events:
             _ep_events[eid] = []
         for i in range(len(sv)):
+            # columns: launch_tick, arrival_tick, owner_slot, launch_x, launch_y, angle, n_ships, src_radius
             _ep_events[eid].append((
                 float(tick), float(tick + arr_dt[i]), float(fslot),
                 float(xs[sv[i]]), float(ys[sv[i]]), float(av[i]), float(nv[i]),
+                float(radii[sv[i]]),
             ))
 
     fleet_arrays_by_ep = {eid: np.array(evs, dtype=np.float32)
@@ -469,8 +473,10 @@ def preprocess():
                 if K > 0:
                     dt    = tick - in_t[:, 0]
                     speed = _fleet_speed_batch(in_t[:, 6])
-                    cx    = in_t[:, 3] + np.cos(in_t[:, 5]) * speed * dt
-                    cy    = in_t[:, 4] + np.sin(in_t[:, 5]) * speed * dt
+                    # Start from planet surface (launch_x/y are planet centers)
+                    r_src = in_t[:, 7]
+                    cx    = in_t[:, 3] + np.cos(in_t[:, 5]) * (r_src + speed * dt)
+                    cy    = in_t[:, 4] + np.sin(in_t[:, 5]) * (r_src + speed * dt)
                     fdx   = cx - 50.0;  fdy = cy - 50.0
                     fleet_arr[:K, 0] = np.arange(K, dtype=np.float32)
                     fleet_arr[:K, 1] = np.where(in_t[:, 2] == slot, 1.0, -1.0)
@@ -565,7 +571,7 @@ def train(planet_obs=None, ships_target=None, owner_mask=None, returns=None,
         ],
         boundaries=[warmup_steps],
     )
-    opt       = optax.contrib.muon(learning_rate=schedule, weight_decay=args.weight_decay)
+    opt       = optax.contrib.adan(learning_rate=schedule, weight_decay=args.weight_decay)
     opt_state = opt.init(params)
 
     resume_path = args.out.replace('.pkl', '_resume.pkl')
@@ -585,7 +591,7 @@ def train(planet_obs=None, ships_target=None, owner_mask=None, returns=None,
         print(f"  Resumed at epoch {start_epoch} | best_val={best_val:.4f}")
 
     def _xent(planets_b, ships_tgt_b, owner_mask_b, fleets_b, fmask_b, actor_inst):
-        pmask       = planets_b[..., 5] >= 0
+        pmask       = planets_b[..., 4] > 0   # radius > 0 — excludes zero-padded ghost slots
         logits      = actor_inst(planets_b, fleets_b, planet_mask=pmask, fleet_mask=fmask_b)
         total_sent  = ships_tgt_b.sum(axis=-1, keepdims=True)
         target_dist = ships_tgt_b / (total_sent + 1e-8)
