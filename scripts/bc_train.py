@@ -45,7 +45,7 @@ parser.add_argument('--min-games',      type=int,   default=20)
 parser.add_argument('--epochs',         type=int,   default=50)
 parser.add_argument('--critic-epochs',  type=int,   default=30)
 parser.add_argument('--batch-size',     type=int,   default=1024)
-parser.add_argument('--lr',             type=float, default=1e-3)
+parser.add_argument('--lr',             type=float, default=3e-3)
 parser.add_argument('--weight-decay',   type=float, default=1e-2,
                     help='AdamW weight decay (grokking-inspired; applied to 1D params via Muon)')
 parser.add_argument('--gamma',          type=float, default=0.99,
@@ -102,7 +102,7 @@ def _rezero_summary(params) -> str:
 
     groups = {'ca': [], 'ca_ffn': [], 'sa': [], 'sa_ffn': []}
     for name, v in named:
-        if 'cross_attention_block' in name:
+        if 'ca_block' in name or 'cross_attention_block' in name:
             groups['ca_ffn' if 'ffn' in name else 'ca'].append(v)
         else:
             groups['sa_ffn' if 'ffn' in name else 'sa'].append(v)

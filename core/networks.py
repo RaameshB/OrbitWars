@@ -223,7 +223,8 @@ class Actor(nnx.Module):
         for i in range(mid, self.num_sa_layers):
             p_emb = getattr(self, f'sa_block_{i}')(p_emb, p_coords, planet_mask=planet_mask)
 
-        planetary_logits = jnp.einsum('...id,...jd->...ij', self.q_action(p_emb), self.k_action(p_emb))
+        scale = p_emb.shape[-1] ** 0.5
+        planetary_logits = jnp.einsum('...id,...jd->...ij', self.q_action(p_emb), self.k_action(p_emb)) / scale
 
         # +1.0 exploration bias keeps deep space competitive against 60 planet logits
         ds_prob   = self.deep_space_prob(p_emb) + 1.0
