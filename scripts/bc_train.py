@@ -58,6 +58,8 @@ parser.add_argument('--resume',         action='store_true',
                     help='Resume from local checkpoint saved alongside --out')
 parser.add_argument('--checkpoint-every',type=int,   default=30,
                     help='Upload BC weights to R2 every N epochs (0 = disabled)')
+parser.add_argument('--r2-prefix',       type=str,   default='bc_v9',
+                    help='R2 key prefix for checkpoint uploads (e.g. bc_v9)')
 parser.add_argument('--eval-every',     type=int,   default=1,
                     help='Run val loss every N epochs (set >1 to save compute)')
 args = parser.parse_args()
@@ -674,7 +676,7 @@ def train(planet_obs=None, ships_target=None, owner_mask=None, returns=None,
             }
             with open(resume_path, 'wb') as f:
                 pickle.dump(ckpt, f)
-            _upload_to_r2(args.out, hist_path, resume_path)
+            _upload_to_r2(args.out, hist_path, resume_path, prefix=args.r2_prefix)
 
         if val_loss < best_val:
             best_val = val_loss
@@ -815,7 +817,7 @@ def pretrain_critic(planet_obs=None, returns=None, fleet_obs=None, fleet_mask=No
             _log_rezero(params, label=f'critic epoch {epoch+1}')
 
         if args.checkpoint_every > 0 and (epoch + 1) % args.checkpoint_every == 0:
-            _upload_to_r2(args.critic_out)
+            _upload_to_r2(args.critic_out, prefix=args.r2_prefix)
 
         if val_loss < best_val:
             best_val = val_loss
