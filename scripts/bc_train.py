@@ -566,17 +566,16 @@ def train(planet_obs=None, ships_target=None, owner_mask=None, returns=None,
     actor_graph, params = nnx.split(actor)
 
     steps_per_epoch = N_train // args.batch_size
-    total_steps     = steps_per_epoch * args.epochs
     warmup_steps    = args.warmup_epochs * steps_per_epoch
-    decay_steps     = max(total_steps - warmup_steps, 1)
     min_lr          = args.lr * 0.01
     alpha_lr        = args.lr * args.alpha_lr_scale
 
-    # One-cycle schedule for main weights: linear warmup → cosine decay
+    # Warmup → constant: linear ramp to peak LR, then hold for the rest of training
+    # (cosine decay would suppress the sustained high-LR phase needed for late generalization)
     main_schedule = optax.join_schedules(
         schedules=[
             optax.linear_schedule(min_lr, args.lr, warmup_steps),
-            optax.cosine_decay_schedule(args.lr, decay_steps, alpha=min_lr / args.lr),
+            optax.constant_schedule(args.lr),
         ],
         boundaries=[warmup_steps],
     )
