@@ -29,7 +29,7 @@ HIDDEN_DIM    = 48
 NUM_SA_LAYERS = 6
 NEW_LR        = 4e-2
 NEW_EPOCHS    = 150
-NEW_BATCH     = 4096
+NEW_BATCH     = 8192
 WARMUP_EPOCHS = 5
 R2_PREFIX     = 'bc_v13_3bc'
 
