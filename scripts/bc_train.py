@@ -840,16 +840,19 @@ def train(planet_obs=None, ships_target=None, owner_mask=None, returns=None,
         print(f"  Transferred {transferred} / reinitialized {reinitialized} parameter leaves")
 
     steps_per_epoch = N_train_w // args.batch_size
+    total_steps     = args.epochs * steps_per_epoch
     warmup_steps    = args.warmup_epochs * steps_per_epoch
+    decay_steps     = max(total_steps - warmup_steps, 1)
 
     schedule = optax.join_schedules(
         schedules=[
             optax.linear_schedule(0.0, args.lr, max(warmup_steps, 1)),
-            optax.constant_schedule(args.lr),
+            optax.cosine_decay_schedule(args.lr, decay_steps, alpha=0.01),
         ],
         boundaries=[warmup_steps],
     )
-    opt       = optax.contrib.muon(learning_rate=schedule, weight_decay=args.weight_decay)
+    opt       = optax.contrib.muon(learning_rate=schedule, weight_decay=args.weight_decay,
+                                   adam_b2=0.95)
     opt_state = opt.init(params)
 
     resume_path = args.out.replace('.pkl', '_resume.pkl')
