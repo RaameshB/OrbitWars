@@ -150,6 +150,7 @@ class PlanetMidCrossAttentionBlock(nnx.Module):
 
 class PlanetSelfAttentionBlock(nnx.Module):
     def __init__(self, hidden_dim: int, rngs: nnx.Rngs):
+        self._head_dim = hidden_dim // 2
         self.self_attn = nnx.MultiHeadAttention(
             num_heads=2,
             in_features=hidden_dim,
@@ -158,8 +159,10 @@ class PlanetSelfAttentionBlock(nnx.Module):
             rngs=rngs,
             decode=False
         )
-        self.norm1 = nnx.LayerNorm(hidden_dim, rngs=rngs)
-        self.norm2 = nnx.LayerNorm(hidden_dim, rngs=rngs)
+        self.norm1  = nnx.LayerNorm(hidden_dim, rngs=rngs)
+        self.norm2  = nnx.LayerNorm(hidden_dim, rngs=rngs)
+        self.q_norm = nnx.LayerNorm(self._head_dim, rngs=rngs)
+        self.k_norm = nnx.LayerNorm(self._head_dim, rngs=rngs)
         self.rel_bias_mlp = nnx.Sequential(
             nnx.Linear(3, 16, rngs=rngs),
             jax.nn.silu,
@@ -172,7 +175,6 @@ class PlanetSelfAttentionBlock(nnx.Module):
         )
 
     def __call__(self, p_emb, p_coords, planet_mask=None):
-
         rel_feats   = get_relative_features(p_coords, p_coords)   # [..., 60, 60, 3]
         bias_logits = self.rel_bias_mlp(rel_feats)                 # [..., 60, 60, 2]
         attn_bias   = jnp.moveaxis(bias_logits, -1, -3)           # [..., 2, 60, 60]
@@ -180,7 +182,21 @@ class PlanetSelfAttentionBlock(nnx.Module):
         if planet_mask is not None:
             attn_bias = jnp.where(planet_mask[..., None, None, :], attn_bias, -1e9)
 
-        sa_out = self.self_attn(inputs_q=self.norm1(p_emb), mask=attn_bias)
+        x = self.norm1(p_emb)
+        q = self.q_norm(self.self_attn.query(x))   # [..., 60, 2, 24]
+        k = self.k_norm(self.self_attn.key(x))     # [..., 60, 2, 24]
+        v = self.self_attn.value(x)                # [..., 60, 2, 24]
+
+        q = jnp.moveaxis(q, -2, -3)               # [..., 2, 60, 24]
+        k = jnp.moveaxis(k, -2, -3)
+        v = jnp.moveaxis(v, -2, -3)
+
+        scale       = self._head_dim ** -0.5
+        attn_logits = jnp.einsum('...hid,...hjd->...hij', q, k) * scale + attn_bias
+        attn_out    = jnp.einsum('...hij,...hjd->...hid',
+                                 jax.nn.softmax(attn_logits, axis=-1), v)  # [..., 2, 60, 24]
+        sa_out = self.self_attn.out(jnp.moveaxis(attn_out, -3, -2))        # [..., 60, 48]
+
         p_emb = p_emb + sa_out
         return p_emb + self.ffn(self.norm2(p_emb))
 
