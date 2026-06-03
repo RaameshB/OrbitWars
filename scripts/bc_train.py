@@ -11,7 +11,9 @@ v13.1 preprocessing changes vs v13:
   - ALL ticks per player (wait ticks included; diagonal = ships held = fire-control signal)
   - Enemy encoding: ranked distinct negative values by current ship strength
   - MAX_FLEET_OBS=128 (no pruning at 64)
-  - top-k default 20, --duel-weight 2 (duels oversampled at training time)
+  - top-k = 10 (kept low to avoid strategy poisoning; 4× augmentation gives ample data)
+  - FFA oversampled 3× at training time (--ffa-weight 3) to balance 3:1 duel:ffa ratio
+  - Hold-only ticks subsampled to 10% at training time (--hold-rate 0.1) to prevent degenerate hold policy
   - n_players saved per sample for weighted training sampler
   - On-the-fly 4-fold rotation augmentation during training
   - Training loss: diagonal included as valid target, has_ships mask replaces has_action
@@ -51,8 +53,10 @@ parser.add_argument('--out',            default='/tmp/weights_bc.pkl')
 parser.add_argument('--critic-out',     default='/tmp/weights_bc_critic.pkl')
 parser.add_argument('--top-k',          type=int,   default=10)
 parser.add_argument('--min-games',      type=int,   default=20)
-parser.add_argument('--duel-weight',    type=int,   default=2,
-                    help='Oversample 2-player games by this factor at training time')
+parser.add_argument('--ffa-weight',     type=int,   default=3,
+                    help='Oversample 4-player FFA games by this factor at training time (balances ~3:1 duel:ffa ratio)')
+parser.add_argument('--hold-rate',      type=float, default=0.1,
+                    help='Fraction of hold-only ticks (no off-diagonal sends) to keep at training time (1.0 = keep all)')
 parser.add_argument('--epochs',         type=int,   default=50)
 parser.add_argument('--critic-epochs',  type=int,   default=30)
 parser.add_argument('--batch-size',     type=int,   default=512)
@@ -749,23 +753,55 @@ def train(planet_obs=None, ships_target=None, owner_mask=None, returns=None,
     rng = np.random.default_rng(42)
     perm   = rng.permutation(N)
     n_val  = max(1, int(N * args.val_frac))
-    val_idx   = perm[:n_val]
-    train_idx = perm[n_val:]
-    N_train   = len(train_idx)
+    val_idx     = perm[:n_val]
+    val_idx_nat = val_idx.copy()   # natural distribution val — no subsampling, for diagnostic only
+    train_idx   = perm[n_val:]
+    N_train     = len(train_idx)
 
-    # Build weighted train index: duel samples repeated duel_weight times
-    if n_players is not None and args.duel_weight > 1:
-        is_duel = n_players[train_idx] == 2
-        duel_extra = np.tile(train_idx[is_duel], args.duel_weight - 1)
-        train_idx_w = np.concatenate([train_idx, duel_extra])
-        print(f"  Duel weighting: {is_duel.sum():,} duel → ×{args.duel_weight} "
-              f"→ effective train size {len(train_idx_w):,}")
+    # Hold subsampling: applied identically to train and val to keep same distribution
+    if args.hold_rate < 1.0:
+        diag_mask_2d   = np.eye(60, dtype=bool)
+        ships_off_diag = ships_target * (~diag_mask_2d)[None, :, :]
+        off_per_sample = (ships_off_diag * owner_mask[:, :, None]).sum(axis=(1, 2))
+        is_action      = off_per_sample > 0.5
+        del ships_off_diag, off_per_sample
+
+        action_tr   = train_idx[is_action[train_idx]]
+        hold_tr     = train_idx[~is_action[train_idx]]
+        n_hold_keep = max(1, int(len(hold_tr) * args.hold_rate))
+        train_idx   = np.concatenate([action_tr, rng.choice(hold_tr, size=n_hold_keep, replace=False)])
+        print(f"  Hold subsampling (train): {len(action_tr):,} action + {len(hold_tr):,} hold "
+              f"→ kept {n_hold_keep:,} hold → {len(train_idx):,} total "
+              f"({len(action_tr)/len(train_idx)*100:.1f}% action)")
+        N_train = len(train_idx)
+
+        action_v     = val_idx[is_action[val_idx]]
+        hold_v       = val_idx[~is_action[val_idx]]
+        n_hold_keep_v = max(1, int(len(hold_v) * args.hold_rate))
+        val_idx      = np.concatenate([action_v, rng.choice(hold_v, size=n_hold_keep_v, replace=False)])
+        print(f"  Hold subsampling (val):   {len(action_v):,} action + {len(hold_v):,} hold "
+              f"→ kept {n_hold_keep_v:,} hold → {len(val_idx):,} total "
+              f"({len(action_v)/len(val_idx)*100:.1f}% action)")
+
+    # FFA oversampling: applied identically to train and val
+    if n_players is not None and args.ffa_weight > 1:
+        is_ffa_tr   = n_players[train_idx] == 4
+        train_idx_w = np.concatenate([train_idx, np.tile(train_idx[is_ffa_tr], args.ffa_weight - 1)])
+        n_duel = (~is_ffa_tr).sum(); n_ffa = is_ffa_tr.sum()
+        print(f"  FFA weighting (train): {n_duel:,} duel / {n_ffa:,} ffa → ffa ×{args.ffa_weight} "
+              f"→ train size {len(train_idx_w):,}")
+
+        is_ffa_v  = n_players[val_idx] == 4
+        val_idx_w = np.concatenate([val_idx, np.tile(val_idx[is_ffa_v], args.ffa_weight - 1)])
+        print(f"  FFA weighting (val):   val size {len(val_idx_w):,}")
     else:
         train_idx_w = train_idx
+        val_idx_w   = val_idx
     N_train_w = len(train_idx_w)
+    n_val_w   = len(val_idx_w)
 
-    print(f"Training actor on {N_train:,} train / {n_val:,} val ticks "
-          f"(effective {N_train_w:,} with duel weighting) | "
+    print(f"Training actor on {N_train:,} train / {len(val_idx):,} val ticks "
+          f"(effective {N_train_w:,} train / {n_val_w:,} val with hold+FFA weighting) | "
           f"batch={args.batch_size} | epochs={args.epochs} | wd={args.weight_decay}")
 
     actor = Actor(hidden_dim=HIDDEN_DIM, num_sa_layers=NUM_SA_LAYERS, rngs=nnx.Rngs(0))
@@ -919,8 +955,9 @@ def train(planet_obs=None, ships_target=None, owner_mask=None, returns=None,
 
         if do_eval:
             val_losses = []
-            for start in range(0, n_val - args.batch_size, args.batch_size):
-                bi = val_idx[start:start + args.batch_size]
+            val_perm = rng.permutation(n_val_w)
+            for start in range(0, n_val_w - args.batch_size, args.batch_size):
+                bi = val_idx_w[val_perm[start:start + args.batch_size]]
                 val_losses.append(float(eval_step(
                     params,
                     jnp.array(planet_obs[bi]),
@@ -930,8 +967,26 @@ def train(planet_obs=None, ships_target=None, owner_mask=None, returns=None,
                     jnp.array(fleet_mask[bi]),
                 )))
             val_loss = float(np.mean(val_losses))
+
+            # Natural distribution diagnostic (no hold subsampling / FFA weighting) — every 25 epochs
+            nat_val_str = ''
+            if (epoch + 1) % 25 == 0:
+                nat_losses = []
+                nat_perm = rng.permutation(len(val_idx_nat))
+                for start in range(0, len(val_idx_nat) - args.batch_size, args.batch_size):
+                    bi = val_idx_nat[nat_perm[start:start + args.batch_size]]
+                    nat_losses.append(float(eval_step(
+                        params,
+                        jnp.array(planet_obs[bi]),
+                        jnp.array(ships_target[bi]),
+                        jnp.array(owner_mask[bi]),
+                        jnp.array(fleet_obs[bi]),
+                        jnp.array(fleet_mask[bi]),
+                    )))
+                nat_val_str = f'  nat_val={float(np.mean(nat_losses)):.4f}'
+
             print(f"Epoch {epoch+1:>3d}/{args.epochs} | "
-                  f"train={train_loss:.4f}  val={val_loss:.4f} | {time.time()-t0:.1f}s  {_rezero_summary(params)}")
+                  f"train={train_loss:.4f}  val={val_loss:.4f}{nat_val_str} | {time.time()-t0:.1f}s  {_rezero_summary(params)}")
             history.append({'epoch': epoch + 1, 'train_loss': train_loss, 'val_loss': val_loss})
             with open(hist_path, 'w') as f:
                 json.dump({'actor': history}, f)
