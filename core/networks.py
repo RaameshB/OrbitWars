@@ -33,12 +33,8 @@ def get_relative_features(q_coords, kv_coords):
 
     return jnp.stack([norm_dist, sin_theta, cos_theta], axis=-1)
 
-# Diagonal of [60,60] planetary block zeroed; deep-space columns (60-63) always allowed.
-# Shape [60, 64] — defined once, never changes across steps or games.
+# Destination mask [60, 64]: diagonal zeroed (no self-send), DS columns (60-63) always allowed.
 _SELF_TARGET_MASK = jnp.concatenate([1.0 - jnp.eye(60), jnp.ones((60, 4))], axis=-1)
-
-# 60-only mask: diagonal zeroed, no DS bins. Used by v14+ inference.
-_SELF_TARGET_MASK_60 = 1.0 - jnp.eye(60)
 
 class PlanetCrossAttentionBlock(nnx.Module):
     def __init__(self, hidden_dim: int, rngs: nnx.Rngs):
@@ -199,13 +195,15 @@ class Actor(nnx.Module):
         self.ca_block_1 = PlanetMidCrossAttentionBlock(hidden_dim, rngs=rngs)
 
         self.final_norm = nnx.LayerNorm(hidden_dim, rngs=rngs)
-        self.q_action = nnx.Linear(hidden_dim, hidden_dim, rngs=rngs)
-        self.k_action = nnx.Linear(hidden_dim, hidden_dim, rngs=rngs)
-        self.deep_space_prob = nnx.Linear(hidden_dim, 4, rngs=rngs)
-        # sin/cos output avoids the ±π wrap discontinuity; atan2 applied at decode time
-        self.deep_space_sincos = nnx.Linear(hidden_dim, 8, rngs=rngs)
-        # Per-planet temperature: softplus + 0.1 ensures T > 0.1
-        self.temperature_head = nnx.Linear(hidden_dim, 1, rngs=rngs)
+        # Decomposed action head:
+        #   hold_head  → sigmoid → fraction of ships to hold (trained via MSE)
+        #   dest_q/k   → dot-product logits over 60 planets (self masked) + 4 DS bins
+        #   ds_sincos  → sin/cos angle per DS bin; atan2 applied at decode time
+        self.hold_head = nnx.Linear(hidden_dim, 1, rngs=rngs)
+        self.dest_q    = nnx.Linear(hidden_dim, hidden_dim, rngs=rngs)
+        self.dest_k    = nnx.Linear(hidden_dim, hidden_dim, rngs=rngs)
+        self.ds_prob   = nnx.Linear(hidden_dim, 4, rngs=rngs)
+        self.ds_sincos = nnx.Linear(hidden_dim, 8, rngs=rngs)
 
     def __call__(self, planets, fleets, planet_mask=None, fleet_mask=None):
         p_emb    = self.ca_block_0(planets, fleets, fleet_mask=fleet_mask)
@@ -221,19 +219,19 @@ class Actor(nnx.Module):
             p_emb = getattr(self, f'sa_block_{i}')(p_emb, p_coords, planet_mask=planet_mask)
 
         p_emb = self.final_norm(p_emb)
-        planetary_logits = jnp.einsum('...id,...jd->...ij', self.q_action(p_emb), self.k_action(p_emb))
 
-        # +1.0 exploration bias keeps deep space competitive against 60 planet logits
-        ds_prob   = self.deep_space_prob(p_emb) + 1.0
-        ds_sincos = jnp.tanh(self.deep_space_sincos(p_emb))
+        hold_logit = self.hold_head(p_emb)                                          # [B, 60, 1]
+        planet_logits = jnp.einsum('...id,...jd->...ij', self.dest_q(p_emb), self.dest_k(p_emb))  # [B, 60, 60]
+        # +1.0 exploration bias keeps DS competitive against 60 planet logits
+        ds_prob   = self.ds_prob(p_emb) + 1.0                                       # [B, 60, 4]
+        ds_sincos = jnp.tanh(self.ds_sincos(p_emb))                                 # [B, 60, 8]
 
-        T = jax.nn.softplus(self.temperature_head(p_emb)) + 0.1
-        logits = jnp.concatenate([
-            jnp.concatenate([planetary_logits, ds_prob], axis=-1) / T,
+        # Output layout per planet: [hold(1) | dest_logits(64) | ds_sincos(8)] = 73
+        return jnp.concatenate([
+            hold_logit,
+            jnp.concatenate([planet_logits, ds_prob], axis=-1),
             ds_sincos,
         ], axis=-1)
-
-        return logits
 
 class Critic(nnx.Module):
     def __init__(self, hidden_dim: int, num_sa_layers: int = 6, rngs: nnx.Rngs = None):
@@ -243,8 +241,9 @@ class Critic(nnx.Module):
         for i in range(num_sa_layers):
             setattr(self, f'sa_block_{i}', PlanetSelfAttentionBlock(hidden_dim, rngs=rngs))
 
+        self.action_hold_proj   = nnx.Linear(1,  hidden_dim, rngs=rngs)
         self.action_logits_proj = nnx.Linear(64, hidden_dim, rngs=rngs)
-        self.action_sincos_proj = nnx.Linear(8, hidden_dim, rngs=rngs)
+        self.action_sincos_proj = nnx.Linear(8,  hidden_dim, rngs=rngs)
 
         self.pa_proj = nnx.Linear(hidden_dim * 2, hidden_dim, rngs=rngs)
 
@@ -272,7 +271,10 @@ class Critic(nnx.Module):
             sa = getattr(self, f'sa_block_{i}')
             p_emb = sa(p_emb, p_coords, planet_mask=planet_mask)
 
-        a_emb = self.action_logits_proj(jax.nn.softmax(actions[..., :64], axis=-1)) + self.action_sincos_proj(actions[..., 64:])
+        # actions layout: [hold(1) | dest_logits(64) | ds_sincos(8)] = 73
+        a_emb = (self.action_hold_proj(jax.nn.sigmoid(actions[..., :1]))
+               + self.action_logits_proj(jax.nn.softmax(actions[..., 1:65], axis=-1))
+               + self.action_sincos_proj(actions[..., 65:73]))
         pa_emb = jnp.concatenate([p_emb, a_emb], axis=-1)
         pa_proj = jax.nn.silu(self.pa_proj(pa_emb))
 
@@ -302,31 +304,27 @@ class DoubleCritic(nnx.Module):
         v2 = self.q2(planets, fleets, actions, planet_mask=planet_mask, fleet_mask=fleet_mask)
         return v1, v2
 
-def logits_to_action(raw_actions, current_ships, mask_self=True, include_ds=True):
+def logits_to_action(raw_actions, current_ships, mask_self=True):
     """
-    raw_actions: [B, 60, 72]  — 64 temperature-scaled softmax logits + 8 ds sin/cos
-    current_ships: [B, 60]
-    mask_self: if True, zero out diagonal (planet sending to itself)
-    include_ds: if True, softmax over 64 bins (60 planet + 4 DS); if False, 60 bins only
+    raw_actions: [B, 60, 73]
+      [0]      hold logit   → sigmoid → hold fraction
+      [1:65]   dest logits  → softmax over 60 planets + 4 DS bins (self masked)
+      [65:73]  ds sincos    → atan2 → launch angle for 4 DS bins
 
-    returns: (ships, angle)
-    ships: [B, 60, 64] or [B, 60, 60] depending on include_ds
-    angle: [B, 60, 4] - launch angle for the 4 deep space bins
+    returns: (ships, ds_angle)
+      ships:    [B, 60, 64]  ships allocated per destination (60 planets + 4 DS)
+      ds_angle: [B, 60, 4]   launch angle for each DS bin
     """
-    if include_ds:
-        logits = raw_actions[..., :64]
-        probs  = jax.nn.softmax(logits, axis=-1)
-        ships  = probs * current_ships[..., None]
-        if mask_self:
-            ships = ships * _SELF_TARGET_MASK
-    else:
-        logits = raw_actions[..., :60]
-        probs  = jax.nn.softmax(logits, axis=-1)
-        ships  = probs * current_ships[..., None]
-        if mask_self:
-            ships = ships * _SELF_TARGET_MASK_60
+    hold_frac = jax.nn.sigmoid(raw_actions[..., 0])          # [B, 60]
+    dest_logits = raw_actions[..., 1:65]                      # [B, 60, 64]
+    if mask_self:
+        dest_logits = dest_logits * _SELF_TARGET_MASK
+    dest_probs = jax.nn.softmax(dest_logits, axis=-1)         # [B, 60, 64]
 
-    ds_sincos = raw_actions[..., 64:72]
+    launch_ships = (1.0 - hold_frac) * current_ships          # [B, 60]
+    ships = dest_probs * launch_ships[..., None]              # [B, 60, 64]
+
+    ds_sincos = raw_actions[..., 65:73]
     ds_angle  = jnp.arctan2(ds_sincos[..., :4], ds_sincos[..., 4:])
 
     return ships, ds_angle

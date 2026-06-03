@@ -896,17 +896,36 @@ def train(planet_obs=None, ships_target=None, owner_mask=None, returns=None,
 
         return planets_r, fleets_r
 
-    def _xent(planets_b, ships_tgt_b, owner_mask_b, fleets_b, fmask_b, actor_inst):
-        pmask = planets_b[..., 4] > 0   # radius > 0 — excludes zero-padded ghost slots
-        logits = actor_inst(planets_b, fleets_b, planet_mask=pmask, fleet_mask=fmask_b)
-        # Diagonal now included as "hold" signal — normalize by total ships per planet
-        total_ships = ships_tgt_b.sum(axis=-1, keepdims=True)
-        target_dist = ships_tgt_b / (total_ships + 1e-8)
-        log_probs   = jax.nn.log_softmax(logits[..., :60], axis=-1)
-        xent        = -jnp.sum(target_dist * log_probs, axis=-1)
-        # has_ships: owned planets with any ships (diagonal or off-diagonal)
-        has_ships   = (total_ships[..., 0] > 0) & owner_mask_b
-        return jnp.sum(xent * has_ships) / (jnp.sum(has_ships) + 1e-8)
+    def _loss(planets_b, ships_tgt_b, owner_mask_b, fleets_b, fmask_b, actor_inst):
+        pmask  = planets_b[..., 4] > 0   # radius > 0 — excludes zero-padded ghost slots
+        raw    = actor_inst(planets_b, fleets_b, planet_mask=pmask, fleet_mask=fmask_b)
+        # raw layout: [hold(1) | dest_logits(64) | ds_sincos(8)] = 73
+
+        diag_idx    = jnp.arange(60)
+        total_ships = ships_tgt_b.sum(axis=-1)                         # [B, 60]
+        has_ships   = (total_ships > 0) & owner_mask_b                 # [B, 60]
+
+        # ── Hold head: MSE on hold fraction (all owned planet-slots with ships) ──
+        held_ships  = ships_tgt_b[:, diag_idx, diag_idx]               # [B, 60]
+        hold_target = held_ships / (total_ships + 1e-8)                # [B, 60] ∈ [0,1]
+        hold_pred   = jax.nn.sigmoid(raw[..., 0])                      # [B, 60]
+        hold_mse    = (hold_pred - hold_target) ** 2                   # [B, 60]
+        hold_loss   = jnp.sum(hold_mse * has_ships) / (jnp.sum(has_ships) + 1e-8)
+
+        # ── Destination head: CE on planet targets only, action planet-slots only ──
+        # Zero diagonal to get off-diagonal (launched) ships only
+        off_diag = ships_tgt_b.at[:, diag_idx, diag_idx].set(0.0)     # [B, 60, 60]
+        launched = off_diag.sum(axis=-1)                               # [B, 60]
+        is_action_planet = (launched > 0.5) & has_ships                # [B, 60]
+
+        # Normalize off-diagonal over 60 planet destinations (DS masked during BC)
+        dest_target  = off_diag / (launched[..., None] + 1e-8)        # [B, 60, 60]
+        dest_logits  = raw[..., 1:61]                                  # [B, 60, 60] planets only
+        log_probs    = jax.nn.log_softmax(dest_logits, axis=-1)
+        dest_xent    = -jnp.sum(dest_target * log_probs, axis=-1)     # [B, 60]
+        dest_loss    = jnp.sum(dest_xent * is_action_planet) / (jnp.sum(is_action_planet) + 1e-8)
+
+        return hold_loss + dest_loss
 
     @jax.jit
     def train_step(params, opt_state, planets_b, ships_tgt_b, owner_mask_b,
@@ -915,7 +934,7 @@ def train(planet_obs=None, ships_target=None, owner_mask=None, returns=None,
         planets_aug, fleets_aug = _rotate_batch(planets_b, fleets_b, rot_k)
 
         def loss_fn(params):
-            return _xent(planets_aug, ships_tgt_b, owner_mask_b, fleets_aug, fmask_b,
+            return _loss(planets_aug, ships_tgt_b, owner_mask_b, fleets_aug, fmask_b,
                          nnx.merge(actor_graph, params))
         loss, grads = jax.value_and_grad(loss_fn)(params)
         updates, new_opt_state = opt.update(grads, opt_state, params)
@@ -923,7 +942,7 @@ def train(planet_obs=None, ships_target=None, owner_mask=None, returns=None,
 
     @jax.jit
     def eval_step(params, planets_b, ships_tgt_b, owner_mask_b, fleets_b, fmask_b):
-        return _xent(planets_b, ships_tgt_b, owner_mask_b, fleets_b, fmask_b,
+        return _loss(planets_b, ships_tgt_b, owner_mask_b, fleets_b, fmask_b,
                      nnx.merge(actor_graph, params))
 
     for epoch in range(start_epoch, args.epochs):

@@ -13,7 +13,8 @@ __pycache__/
 .ipynb_checkpoints/
 
 # Proprietary Training Code (lives in proprietary/ submodule)
-notebooks/
+notebooks/**
+!notebooks/bc_v13_*.ipynb
 old/
 scripts/train.py
 scripts/train_pgame.py
