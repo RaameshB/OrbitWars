@@ -27,7 +27,7 @@ from core.networks import Actor
 
 HIDDEN_DIM    = 48
 NUM_SA_LAYERS = 6
-NEW_LR        = 3e-2
+NEW_LR        = 4e-2
 NEW_EPOCHS    = 150
 NEW_BATCH     = 4096
 WARMUP_EPOCHS = 5
