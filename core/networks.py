@@ -186,16 +186,9 @@ class PlanetSelfAttentionBlock(nnx.Module):
         q = self.q_norm(self.self_attn.query(x))   # [..., 60, 2, 24]
         k = self.k_norm(self.self_attn.key(x))     # [..., 60, 2, 24]
         v = self.self_attn.value(x)                # [..., 60, 2, 24]
-
-        q = jnp.moveaxis(q, -2, -3)               # [..., 2, 60, 24]
-        k = jnp.moveaxis(k, -2, -3)
-        v = jnp.moveaxis(v, -2, -3)
-
-        scale       = self._head_dim ** -0.5
-        attn_logits = jnp.einsum('...hid,...hjd->...hij', q, k) * scale + attn_bias
-        attn_out    = jnp.einsum('...hij,...hjd->...hid',
-                                 jax.nn.softmax(attn_logits, axis=-1), v)  # [..., 2, 60, 24]
-        sa_out = self.self_attn.out(jnp.moveaxis(attn_out, -3, -2))        # [..., 60, 48]
+        # bias: [..., 2, 60, 60] = [..., heads, q, k] — matches dot_product_attention convention
+        sa_out = jax.nn.dot_product_attention(q, k, v, bias=attn_bias)    # [..., 60, 2, 24]
+        sa_out = self.self_attn.out(sa_out)                                # [..., 60, 48]
 
         p_emb = p_emb + sa_out
         return p_emb + self.ffn(self.norm2(p_emb))
