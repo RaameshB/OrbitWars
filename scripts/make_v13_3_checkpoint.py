@@ -61,38 +61,31 @@ actor_graph, dst_params = nnx.split(actor)
 src_leaves, _        = jax.tree_util.tree_flatten_with_path(src_params)
 dst_leaves, dst_tdef = jax.tree_util.tree_flatten_with_path(dst_params)
 
-if len(src_leaves) != len(dst_leaves):
-    print(f'WARNING: leaf count mismatch src={len(src_leaves)} dst={len(dst_leaves)}')
-    print('Falling back to name-matched transfer...')
-    src_dict = {
-        '.'.join(str(k.key if hasattr(k, 'key') else k) for k in path): leaf
-        for path, leaf in src_leaves
-    }
-    new_leaves = []
-    transferred, reinitialized, missing = 0, 0, 0
-    for dst_path, dst_leaf in dst_leaves:
-        path_str = '.'.join(str(k.key if hasattr(k, 'key') else k) for k in dst_path)
-        if any(sub in path_str for sub in REINIT_SUBSTRINGS):
-            new_leaves.append(dst_leaf)
-            reinitialized += 1
-        elif path_str in src_dict:
-            new_leaves.append(src_dict[path_str])
-            transferred += 1
-        else:
+print(f'  src leaves: {len(src_leaves)}, dst leaves: {len(dst_leaves)} — using name-matched transfer')
+src_dict = {
+    '.'.join(str(k.key if hasattr(k, 'key') else k) for k in path): leaf
+    for path, leaf in src_leaves
+}
+new_leaves = []
+transferred, reinitialized, missing = 0, 0, 0
+for dst_path, dst_leaf in dst_leaves:
+    path_str = '.'.join(str(k.key if hasattr(k, 'key') else k) for k in dst_path)
+    if any(sub in path_str for sub in REINIT_SUBSTRINGS):
+        new_leaves.append(dst_leaf)
+        reinitialized += 1
+    elif path_str in src_dict:
+        src_leaf = src_dict[path_str]
+        if src_leaf.shape != dst_leaf.shape:
+            print(f'  shape mismatch (reinit): {path_str} src={src_leaf.shape} dst={dst_leaf.shape}')
             new_leaves.append(dst_leaf)
             missing += 1
-            print(f'  missing in src: {path_str}')
-else:
-    new_leaves = []
-    transferred, reinitialized = 0, 0
-    for (dst_path, dst_leaf), (_, src_leaf) in zip(dst_leaves, src_leaves):
-        path_str = '.'.join(str(k.key if hasattr(k, 'key') else k) for k in dst_path)
-        if any(sub in path_str for sub in REINIT_SUBSTRINGS):
-            new_leaves.append(dst_leaf)
-            reinitialized += 1
         else:
             new_leaves.append(src_leaf)
             transferred += 1
+    else:
+        new_leaves.append(dst_leaf)
+        missing += 1
+        print(f'  missing in src (reinit): {path_str}')
 
 params = jax.tree_util.tree_unflatten(dst_tdef, new_leaves)
 print(f'  Transferred {transferred} leaves, reinitialized {reinitialized} leaves')
