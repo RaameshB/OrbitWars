@@ -1,6 +1,6 @@
 """
 OrbitWars RL Training — REINFORCE → PPO with S5 critic + ELO Hall of Fame
-Script version: v11.23
+Script version: v11.24
 # v10.1: ESN capacity d_max=12, w_max=256
 # v10.2: CMA-ES val/train split (80/20); log r2_val + r2_train + gap
 # v10.3: PCA-compressed readout (D_total 3120→432); W_enc[D_max,enc_dim,W_max] unified
@@ -23,6 +23,7 @@ Script version: v11.23
 # v11.16: Replace DeePr-ESN critic with trainable S5 (diagonal SSM, HiPPO init, associative scan)
 # v11.17: Correct S5 init: B~=V⁻¹B, C~=CV from HiPPO-N eigendecomp; D feedthrough; .real not 2×real
 # v11.23: R²-gated PPO (skip when prev R²<0.2); per-device HoF opponent sampling (8 opps/iter)
+# v11.24: Fix ent cap/floor to use per-planet entropy (normalize by n_owned); thresholds 4.0/1.5
 
 Architecture:
   - Actor:   BC-pretrained transformer, AdamW, Gaussian logit noise for exploration
@@ -79,8 +80,8 @@ class Config:
     launch_gate_bias: float = 0.0     # 0 = use BC's natural gate; S5 critic teaches hold/launch from advantages
     entropy_coef:     float = 0.001   # small bonus; σ=0.3 noise handles exploration
     ent_max_coef:     float = 0.05    # penalty coef for cap and floor
-    ent_target:       float = 8.0     # nats; upper cap — BC-init level ~7.3
-    ent_floor:        float = 6.0     # nats; lower floor — prevents policy collapse
+    ent_target:       float = 4.0     # per-planet nats cap; max = ln(64)≈4.158 (BC near-uniform)
+    ent_floor:        float = 1.5     # per-planet nats floor; ln(4.5)≈1.5 fires when very concentrated
     max_grad_norm:    float = 0.5
     logit_sigma:      float = 0.3     # Gaussian exploration noise on logits
 
@@ -1375,10 +1376,12 @@ def make_ppo_train_fn(actor_graph, optimizer):
         dest_p    = jax.nn.softmax(new_logits[..., 1:65], axis=-1)
         entropy   = -(dest_p * jnp.log(dest_p + 1e-8)).sum(-1)
         ent_loss  = -(entropy * owned_p0 * act_w[:, None]).sum() / n_act
-        mean_ent  = -ent_loss                                      # positive, logged value
-        ent_cap   = CFG.ent_max_coef * jnp.maximum(0.0, mean_ent - CFG.ent_target)
-        ent_floor = CFG.ent_max_coef * jnp.maximum(0.0, CFG.ent_floor - mean_ent)
-        return pg_loss + CFG.entropy_coef * ent_loss + ent_cap + ent_floor, (pg_loss, mean_ent)
+        # per-planet entropy: normalize by mean n_owned so cap/floor are scale-invariant
+        n_owned_wt    = (owned_p0.sum(-1) * act_w).sum() + 1e-8
+        per_planet_ent = (entropy * owned_p0 * act_w[:, None]).sum() / n_owned_wt
+        ent_cap   = CFG.ent_max_coef * jnp.maximum(0.0, per_planet_ent - CFG.ent_target)
+        ent_floor = CFG.ent_max_coef * jnp.maximum(0.0, CFG.ent_floor - per_planet_ent)
+        return pg_loss + CFG.entropy_coef * ent_loss + ent_cap + ent_floor, (pg_loss, per_planet_ent)
 
     @functools.partial(jax.jit, donate_argnums=(0, 1))
     def ppo_train(params, opt_state,
@@ -1489,7 +1492,7 @@ def main():
 
     os.makedirs(CFG.out_dir, exist_ok=True)
     n_devices = jax.device_count()
-    print('train_rl.py  version: v11.23 (R²-gated PPO + per-device HoF opponent sampling)', flush=True)
+    print('train_rl.py  version: v11.24 (per-planet entropy cap/floor + per-device HoF opps)', flush=True)
     print(f'Devices: {n_devices}  ({jax.devices()})')
     print(f'Games per device: {CFG.games_per_device}  Total: {n_devices * CFG.games_per_device}')
 
