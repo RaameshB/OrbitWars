@@ -423,7 +423,44 @@
       color: var(--slot-color);
       margin-bottom: .5rem;
       opacity: .9;
+      display: flex;
+      align-items: center;
+      gap: .45rem;
     }
+
+    .player-dot {
+      width: 10px; height: 10px;
+      border-radius: 50%;
+      flex-shrink: 0;
+      box-shadow: 0 0 6px currentColor;
+    }
+
+    /* ── Scoreboard ───────────────────────────────────────────────────── */
+    .score-board {
+      display: flex;
+      gap: .75rem;
+      padding: 1rem 1.5rem;
+      border-top: 1px solid var(--glass-bd);
+      flex-wrap: wrap;
+    }
+
+    .score-row {
+      display: flex;
+      align-items: center;
+      gap: .55rem;
+      background: rgba(255,255,255,.04);
+      border: 1px solid var(--glass-bd);
+      border-radius: 10px;
+      padding: .55rem .85rem;
+      font-size: .82rem;
+      flex: 1;
+      min-width: 160px;
+    }
+
+    .score-medal { font-size: .9rem; width: 1.4rem; text-align: center; flex-shrink: 0; }
+    .score-dot   { width: 11px; height: 11px; border-radius: 50%; flex-shrink: 0; }
+    .score-name  { flex: 1; font-family: 'JetBrains Mono', monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .score-ships { color: var(--txt-muted); font-size: .75rem; white-space: nowrap; }
 
     .slot-select {
       width: 100%;
@@ -649,7 +686,7 @@
           <button class="run-btn" id="runBtn" onclick="runSimulation()">
             ⬡ &nbsp;LAUNCH SIMULATION
           </button>
-          <span class="run-hint">~3 min compile · JAX XLA on CPU</span>
+          <span class="run-hint">~90 sec · JAX XLA on CPU · GitHub Actions</span>
         </div>
       </div>
     </div>
@@ -670,6 +707,7 @@
       </div>
       <iframe class="replay-iframe" id="replayFrame" title="OrbitWars Replay"></iframe>
     </div>
+    <div class="score-board" id="scoreBoard" style="display:none;"></div>
   </div>
 
 </div><!-- /page -->
@@ -677,7 +715,8 @@
 <script>
 /* ── Config ───────────────────────────────────────────────────────────── */
 const WORKER = 'https://orbit-wars-gateway.raameshb.workers.dev';
-const SLOT_COLORS = ['var(--indigo)', 'var(--violet)', 'var(--cyan)', 'var(--pink)'];
+// Wong colorblind-safe palette — matches the replay renderer exactly
+const SLOT_COLORS = ['#0072B2', '#D55E00', '#009E73', '#F0E442'];
 const SLOT_NAMES  = ['Player 1', 'Player 2', 'Player 3', 'Player 4'];
 
 /* ── State ────────────────────────────────────────────────────────────── */
@@ -782,7 +821,10 @@ function buildSlots() {
   grid.style.gridTemplateColumns = currentMode === 2 ? '1fr 1fr' : '1fr 1fr';
   grid.innerHTML = Array.from({length: currentMode}, (_, i) => `
     <div class="slot-card" style="--slot-color:${SLOT_COLORS[i]}">
-      <div class="slot-label">${SLOT_NAMES[i]}</div>
+      <div class="slot-label">
+        <span class="player-dot" style="background:${SLOT_COLORS[i]};box-shadow:0 0 6px ${SLOT_COLORS[i]}80"></span>
+        ${SLOT_NAMES[i]}
+      </div>
       <select class="slot-select" id="slot${i}"></select>
     </div>`).join('');
   populateSelects();
@@ -831,32 +873,26 @@ async function runSimulation() {
   section.classList.add('visible');
   section.scrollIntoView({ behavior: 'smooth', block: 'start' });
 
-  // Start loading overlay
+  // Reset UI
   const overlay = document.getElementById('loadOverlay');
   const fill    = document.getElementById('progFill');
   const txt     = document.getElementById('loadText');
   const sub     = document.getElementById('loadSubtext');
   overlay.classList.add('active');
+  fill.style.transition = 'width 0.8s linear';
   fill.style.width = '0%';
   txt.textContent = 'Dispatching to GitHub Actions…';
-  sub.textContent = '~3 min · GitHub Actions · ubuntu CPU';
+  sub.textContent = '~90 sec · GitHub Actions · ubuntu CPU';
   btn.disabled = true;
+  document.getElementById('scoreBoard').style.display = 'none';
 
-  const messages = [
-    [5,  'Installing Python dependencies…'],
-    [20, 'Downloading agent weights from R2…'],
-    [40, 'Compiling JAX XLA graphs…'],
-    [60, 'Running simulation rollout…'],
-    [78, 'Rendering interactive replay…'],
-    [88, 'Deploying to GitHub Pages…'],
-    [96, 'Waiting for CDN propagation…'],
-  ];
+  const reqId = crypto.randomUUID();
 
   try {
     const res = await fetch(WORKER, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ players: currentMode, agents })
+      body: JSON.stringify({ players: currentMode, agents, req_id: reqId }),
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
   } catch (e) {
@@ -866,31 +902,77 @@ async function runSimulation() {
     return;
   }
 
-  // Fake progress over ~185s
-  let progress = 0;
-  const total = 185;
-  const interval = setInterval(() => {
-    progress = Math.min(progress + (100 / total), 99);
-    fill.style.width = progress + '%';
-    const msg = messages.filter(([p]) => progress >= p).pop();
+  // Time-based status messages (elapsed seconds)
+  const statusMsgs = [
+    [0,  'Installing Python dependencies…'],
+    [18, 'Downloading agent weights from R2…'],
+    [32, 'Compiling JAX XLA graphs…'],
+    [55, 'Running simulation rollout…'],
+    [78, 'Rendering replay…'],
+  ];
+  const EXPECTED_S = 90;
+
+  const startTime = Date.now();
+  let pollTimer = null;
+
+  function updateProgress() {
+    const elapsed = (Date.now() - startTime) / 1000;
+    fill.style.width = Math.min(elapsed / EXPECTED_S * 100, 95) + '%';
+    const msg = statusMsgs.filter(([s]) => elapsed >= s).pop();
     if (msg) txt.textContent = msg[1];
-    if (progress >= 99) clearInterval(interval);
-  }, 1000);
+    sub.textContent = `${Math.round(elapsed)}s elapsed…`;
+  }
 
-  // Poll for completion (try after ~3min)
-  await new Promise(r => setTimeout(r, 180_000));
-  clearInterval(interval);
-  fill.style.width = '100%';
-  txt.textContent = 'Replay ready!';
+  // Tick progress every second
+  const tickTimer = setInterval(updateProgress, 1000);
 
-  setTimeout(() => {
-    const frame = document.getElementById('replayFrame');
-    frame.src = 'orbit_wars_replay.html?t=' + Date.now();
-    frame.onload = () => {
-      overlay.classList.remove('active');
-      btn.disabled = false;
-    };
-  }, 2000);
+  async function poll() {
+    try {
+      const r = await fetch(`${WORKER}/replay-status/${reqId}`, { cache: 'no-store' });
+      if (r.ok) {
+        clearInterval(tickTimer);
+        clearTimeout(pollTimer);
+        const data = await r.json();
+        const elapsed = Math.round((Date.now() - startTime) / 1000);
+
+        fill.style.transition = 'width 0.3s ease';
+        fill.style.width = '100%';
+        txt.textContent = 'Replay ready!';
+        sub.textContent = `Done in ${elapsed}s`;
+
+        setTimeout(() => {
+          const frame = document.getElementById('replayFrame');
+          frame.src = `${WORKER}/replay/${reqId}`;
+          frame.onload = () => {
+            overlay.classList.remove('active');
+            btn.disabled = false;
+            if (data.meta?.stats) showScoreboard(data.meta.stats);
+          };
+        }, 600);
+        return;
+      }
+    } catch (_) {}
+    // Not ready yet — poll again in 10s
+    pollTimer = setTimeout(poll, 10_000);
+  }
+
+  // First poll after 20s (deps + startup takes ~15-20s minimum)
+  pollTimer = setTimeout(poll, 20_000);
+}
+
+/* ── Scoreboard ───────────────────────────────────────────────────────── */
+function showScoreboard(stats) {
+  const board = document.getElementById('scoreBoard');
+  const sorted = [...stats].sort((a, b) => a.rank - b.rank);
+  const medals = ['🥇', '🥈', '🥉', '4th'];
+  board.innerHTML = sorted.map((s, i) => `
+    <div class="score-row">
+      <span class="score-medal">${medals[i] ?? (i + 1)}</span>
+      <span class="score-dot" style="background:${s.color};box-shadow:0 0 5px ${s.color}80"></span>
+      <span class="score-name">${s.name}</span>
+      <span class="score-ships">${s.total.toLocaleString()} ships</span>
+    </div>`).join('');
+  board.style.display = 'flex';
 }
 
 /* ── Boot ─────────────────────────────────────────────────────────────── */

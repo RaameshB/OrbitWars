@@ -7,7 +7,12 @@ const CORS = {
 
 const GITHUB_OWNER = 'RaameshB';
 const GITHUB_REPO  = 'OrbitWars';
-const R2_KEY       = 'rl_v21/hof_index.json';
+const R2_KEY       = 'rl_v24/hof_index.json';
+
+// UUID-ish safety check — only allow alphanumeric + hyphens, 8-64 chars
+function safeReqId(s) {
+  return typeof s === 'string' && /^[a-zA-Z0-9_-]{8,64}$/.test(s) ? s : null;
+}
 
 export default {
   async fetch(request, env) {
@@ -37,7 +42,50 @@ export default {
       });
     }
 
-    // POST / — trigger GitHub Action with {players, agents}
+    // GET /replay-status/:reqId — check if replay is ready (meta.json exists in R2)
+    const statusMatch = url.pathname.match(/^\/replay-status\/(.+)$/);
+    if (request.method === 'GET' && statusMatch) {
+      const reqId = safeReqId(statusMatch[1]);
+      if (!reqId) {
+        return new Response(JSON.stringify({ error: 'Invalid reqId' }), {
+          status: 400, headers: { ...CORS, 'Content-Type': 'application/json' },
+        });
+      }
+      const obj = await env.R2_BUCKET.get(`replays/${reqId}/meta.json`);
+      if (!obj) {
+        return new Response(JSON.stringify({ ready: false }), {
+          status: 404, headers: { ...CORS, 'Content-Type': 'application/json' },
+        });
+      }
+      const meta = await obj.text();
+      return new Response(JSON.stringify({ ready: true, meta: JSON.parse(meta) }), {
+        headers: { ...CORS, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+      });
+    }
+
+    // GET /replay/:reqId — serve replay HTML from R2
+    const replayMatch = url.pathname.match(/^\/replay\/(.+)$/);
+    if (request.method === 'GET' && replayMatch) {
+      const reqId = safeReqId(replayMatch[1]);
+      if (!reqId) {
+        return new Response('Invalid reqId', { status: 400, headers: CORS });
+      }
+      const obj = await env.R2_BUCKET.get(`replays/${reqId}/replay.html`);
+      if (!obj) {
+        return new Response('Replay not found', { status: 404, headers: CORS });
+      }
+      const body = await obj.text();
+      return new Response(body, {
+        headers: {
+          ...CORS,
+          'Content-Type': 'text/html; charset=utf-8',
+          'Cache-Control': 'no-store',
+          'X-Frame-Options': 'ALLOWALL',
+        },
+      });
+    }
+
+    // POST / — trigger GitHub Action with {players, agents, req_id}
     if (request.method === 'POST' && url.pathname === '/') {
       let payload;
       try {
@@ -51,6 +99,7 @@ export default {
 
       const players = payload.players ?? 4;
       const agents  = Array.isArray(payload.agents) ? payload.agents : [];
+      const req_id  = safeReqId(payload.req_id) ?? '';
 
       const ghRes = await fetch(
         `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/dispatches`,
@@ -64,7 +113,7 @@ export default {
           },
           body: JSON.stringify({
             event_type:     'trigger-simulation',
-            client_payload: { players, agents },
+            client_payload: { players, agents, req_id },
           }),
         }
       );
@@ -78,7 +127,7 @@ export default {
       }
 
       return new Response(
-        JSON.stringify({ success: true, players, agents }),
+        JSON.stringify({ success: true, players, agents, req_id }),
         { headers: { ...CORS, 'Content-Type': 'application/json' } }
       );
     }
