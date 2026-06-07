@@ -73,6 +73,7 @@ jobs:
           R2_BUCKET_NAME:       ${{ secrets.R2_BUCKET_NAME }}
           PLAYERS:              ${{ github.event.client_payload.players || github.event.inputs.players || '4' }}
         run: |
+          source .venv/bin/activate
           # Determine number of players
           PLAYERS="${PLAYERS_DISPATCH:-${PLAYERS_MANUAL:-4}}"
           echo "players=$PLAYERS" >> $GITHUB_OUTPUT
