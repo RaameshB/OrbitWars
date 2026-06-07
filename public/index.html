@@ -940,9 +940,12 @@ async function runSimulation() {
         txt.textContent = 'Replay ready!';
         sub.textContent = `Done in ${elapsed}s`;
 
-        setTimeout(() => {
+        setTimeout(async () => {
           const frame = document.getElementById('replayFrame');
-          frame.src = `${WORKER}/replay/${reqId}`;
+          // Fetch HTML text then load as blob URL to avoid X-Frame-Options on workers.dev
+          const html = await (await fetch(`${WORKER}/replay/${reqId}`, { cache: 'no-store' })).text();
+          const blobUrl = URL.createObjectURL(new Blob([html], { type: 'text/html' }));
+          frame.src = blobUrl;
           frame.onload = () => {
             overlay.classList.remove('active');
             btn.disabled = false;
