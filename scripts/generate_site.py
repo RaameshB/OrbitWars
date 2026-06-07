@@ -141,7 +141,7 @@ def _random_step(state, ep, pid, key):
     target_oh = jax.nn.one_hot(target_idx, MAX_TARGETS)
     s = jnp.where(owned[:, None], ships_send[:, None] * target_oh, 0).astype(jnp.int32)
 
-    angles_raw = jr.uniform(k3, (MAX_BODIES,), -jnp.pi, jnp.pi)
+    angles_raw = jr.uniform(k3, (MAX_BODIES,), minval=-jnp.pi, maxval=jnp.pi)
     a = jnp.broadcast_to(angles_raw[:, None], (MAX_BODIES, MAX_TARGETS))
     a = jnp.where(owned[:, None], a, 0.0)
 
