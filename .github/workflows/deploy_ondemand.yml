@@ -21,6 +21,7 @@ on:
       - 'scripts/jax_visualizer.py'
       - 'core/**'
       - '.github/workflows/deploy_ondemand.yml'
+      - 'requirements-actions.txt'
 
 permissions:
   contents: read
