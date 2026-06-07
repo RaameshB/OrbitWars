@@ -613,8 +613,9 @@
 
     <!-- Leaderboard -->
     <div class="glass" id="lbPanel">
-      <div class="panel-header">
+      <div class="panel-header" style="display:flex;align-items:center;justify-content:space-between;">
         <span class="panel-title">Hall of Fame</span>
+        <button onclick="fetchHoF()" title="Refresh rankings" style="background:none;border:1px solid rgba(99,102,241,0.4);color:var(--accent);border-radius:6px;padding:4px 10px;cursor:pointer;font-size:0.75rem;letter-spacing:0.05em;">↻ Refresh</button>
       </div>
       <div class="tabs">
         <button class="tab active" onclick="switchLbTab('2p', this)">2P Rankings</button>
@@ -663,9 +664,9 @@
     <div class="replay-inner">
       <div class="load-overlay active" id="loadOverlay">
         <div class="loader-ring"></div>
-        <div class="load-text" id="loadText">Initialising JAX XLA graphs…</div>
+        <div class="load-text" id="loadText">Select agents and click Run Simulation</div>
         <div class="progress-track"><div class="progress-fill" id="progFill"></div></div>
-        <div class="load-subtext" id="loadSubtext">Simulation results will appear here</div>
+        <div class="load-subtext" id="loadSubtext">Replay will appear here once complete</div>
       </div>
       <iframe class="replay-iframe" id="replayFrame" title="OrbitWars Replay"></iframe>
     </div>
@@ -838,14 +839,15 @@ async function runSimulation() {
   overlay.classList.add('active');
   fill.style.width = '0%';
   txt.textContent = 'Dispatching to GitHub Actions…';
-  sub.textContent = 'Compiling JAX XLA graphs on CPU';
+  sub.textContent = '~3 min · GitHub Actions · ubuntu CPU';
   btn.disabled = true;
 
   const messages = [
-    [5,  'Downloading R2 checkpoint weights…'],
-    [20, 'Compiling JAX XLA graphs on TPU…'],
-    [45, 'Executing physics engine rollout…'],
-    [70, 'Rendering interactive replay…'],
+    [5,  'Installing Python dependencies…'],
+    [20, 'Downloading agent weights from R2…'],
+    [40, 'Compiling JAX XLA graphs…'],
+    [60, 'Running simulation rollout…'],
+    [78, 'Rendering interactive replay…'],
     [88, 'Deploying to GitHub Pages…'],
     [96, 'Waiting for CDN propagation…'],
   ];

@@ -7,7 +7,7 @@ const CORS = {
 
 const GITHUB_OWNER = 'RaameshB';
 const GITHUB_REPO  = 'OrbitWars';
-const R2_KEY       = 'rl_v20/hof_index.json';
+const R2_KEY       = 'rl_v21/hof_index.json';
 
 export default {
   async fetch(request, env) {
