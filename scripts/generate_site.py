@@ -6,7 +6,7 @@ Usage (from project root):
 Agent identifiers:
     sniper   — rule-based nearest-sniper (pure JAX)
     random   — random agent (pure JAX)
-    <tag>    — HoF agent tag (downloaded from R2 as rl_v20/hof/{mode}/{tag}.pkl)
+    <tag>    — HoF agent tag (downloaded from R2 as rl_v21/hof/{mode}/{tag}.pkl)
 """
 import argparse, os, sys, pickle, functools, json, time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -33,7 +33,7 @@ from scripts.jax_visualizer import jax_states_to_kaggle_env
 HIDDEN_DIM    = 48
 NUM_SA_LAYERS = 6
 MAX_TARGETS   = 64          # 60 planet/comet slots + 4 DS slots
-R2_PREFIX     = 'rl_v20'
+R2_PREFIX     = 'rl_v21'
 PLAYER_COLORS = ['#0072B2', '#D55E00', '#009E73', '#F0E442']
 BUILTIN_TAGS  = {'sniper', 'random'}
 
