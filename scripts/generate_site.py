@@ -135,7 +135,7 @@ def _random_step(state, ep, pid, key):
 
     k1, k2, k3 = jr.split(key, 3)
     target_idx  = jr.randint(k1, (MAX_BODIES,), 0, MAX_BODIES)
-    ship_frac   = jr.uniform(k2, (MAX_BODIES,), 0.3, 0.7)
+    ship_frac   = jr.uniform(k2, (MAX_BODIES,), minval=0.3, maxval=0.7)
     ships_send  = (ships * ship_frac).astype(jnp.int32)
 
     target_oh = jax.nn.one_hot(target_idx, MAX_TARGETS)
