@@ -171,6 +171,35 @@ jobs:
               print(f"Uploaded {key}")
           PYEOF
 
+      - name: Clean up old replays from R2 (>7 days)
+        if: steps.resolve.outputs.req_id != ''
+        env:
+          R2_ENDPOINT_URL:       ${{ secrets.R2_ENDPOINT_URL }}
+          AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          R2_BUCKET_NAME:        ${{ secrets.R2_BUCKET_NAME }}
+        run: |
+          source .venv/bin/activate
+          python3 - <<'PYEOF'
+          import boto3, os
+          from datetime import datetime, timezone, timedelta
+          s3 = boto3.client('s3',
+              endpoint_url=os.environ['R2_ENDPOINT_URL'],
+              aws_access_key_id=os.environ['AWS_ACCESS_KEY_ID'],
+              aws_secret_access_key=os.environ['AWS_SECRET_ACCESS_KEY'],
+              region_name='auto')
+          bucket = os.environ['R2_BUCKET_NAME']
+          cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+          paginator = s3.get_paginator('list_objects_v2')
+          deleted = 0
+          for page in paginator.paginate(Bucket=bucket, Prefix='replays/'):
+              for obj in page.get('Contents', []):
+                  if obj['LastModified'] < cutoff:
+                      s3.delete_object(Bucket=bucket, Key=obj['Key'])
+                      deleted += 1
+          print(f"Deleted {deleted} stale replay object(s)")
+          PYEOF
+
       - name: Copy current HoF index into public/
         env:
           R2_ENDPOINT_URL:       ${{ secrets.R2_ENDPOINT_URL }}
