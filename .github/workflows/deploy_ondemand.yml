@@ -53,6 +53,11 @@ jobs:
           AGENTS_DISPATCH:  ${{ toJson(github.event.client_payload.agents) }}
           PLAYERS_MANUAL:   ${{ github.event.inputs.players }}
           AGENTS_MANUAL:    ${{ github.event.inputs.agents }}
+          R2_ENDPOINT_URL:      ${{ secrets.R2_ENDPOINT_URL }}
+          AWS_ACCESS_KEY_ID:    ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          R2_BUCKET_NAME:       ${{ secrets.R2_BUCKET_NAME }}
+          PLAYERS:              ${{ github.event.client_payload.players || github.event.inputs.players || '4' }}
         run: |
           # Determine number of players
           PLAYERS="${PLAYERS_DISPATCH:-${PLAYERS_MANUAL:-4}}"
@@ -103,12 +108,6 @@ jobs:
 
           echo "agents=$AGENTS" >> $GITHUB_OUTPUT
           echo "Resolved: players=$PLAYERS agents=$AGENTS"
-        env:
-          R2_ENDPOINT_URL:    ${{ secrets.R2_ENDPOINT_URL }}
-          AWS_ACCESS_KEY_ID:  ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          R2_BUCKET_NAME:     ${{ secrets.R2_BUCKET_NAME }}
-          PLAYERS:            ${{ github.event.client_payload.players || github.event.inputs.players || '4' }}
 
       - name: Generate Replay HTML
         env:
