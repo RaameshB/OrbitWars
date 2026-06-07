@@ -13,6 +13,14 @@ on:
         description: "Space-separated agent tags (e.g. 'bc_init iter0099 sniper random')"
         required: false
         default: ""
+  push:
+    branches: [main]
+    paths:
+      - 'public/**'
+      - 'scripts/generate_site.py'
+      - 'scripts/jax_visualizer.py'
+      - 'core/**'
+      - '.github/workflows/deploy_ondemand.yml'
 
 permissions:
   contents: read
@@ -35,13 +43,19 @@ jobs:
       - name: Install uv
         run: curl -LsSf https://astral.sh/uv/install.sh | sh && echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
+      - name: Cache uv packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-py3.12-${{ hashFiles('requirements-actions.txt') }}
+          restore-keys: |
+            uv-${{ runner.os }}-py3.12-
+
       - name: Create venv and install dependencies
         run: |
           uv venv --python 3.12
           source .venv/bin/activate
-          # JAX CPU build + project deps
-          uv pip install "jax[cpu]" flax optax orbax-checkpoint boto3 kaggle-environments
-          # Install remaining project deps if pyproject.toml exists
+          uv pip install -r requirements-actions.txt
           if [ -f pyproject.toml ]; then
             uv pip install -e . --no-deps 2>/dev/null || true
           fi

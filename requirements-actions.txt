@@ -1,0 +1,6 @@
+jax[cpu]
+flax
+optax
+orbax-checkpoint
+boto3
+kaggle-environments
