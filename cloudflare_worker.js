@@ -74,8 +74,9 @@ export default {
       if (!obj) {
         return new Response('Replay not found', { status: 404, headers: CORS });
       }
-      const body = await obj.text();
-      return new Response(body, {
+      // Stream R2 body directly — avoids buffering large HTML into a string,
+      // which can exceed the Workers free-tier CPU time limit.
+      return new Response(obj.body, {
         headers: {
           ...CORS,
           'Content-Type': 'text/html; charset=utf-8',
