@@ -648,7 +648,7 @@
           <button class="run-btn" id="runBtn" onclick="runSimulation()">
             ⬡ &nbsp;LAUNCH SIMULATION
           </button>
-          <span class="run-hint">~3 min compile · JAX XLA on TPU</span>
+          <span class="run-hint">~3 min compile · JAX XLA on CPU</span>
         </div>
       </div>
     </div>
@@ -838,7 +838,7 @@ async function runSimulation() {
   overlay.classList.add('active');
   fill.style.width = '0%';
   txt.textContent = 'Dispatching to GitHub Actions…';
-  sub.textContent = 'Compiling JAX XLA graphs on TPU';
+  sub.textContent = 'Compiling JAX XLA graphs on CPU';
   btn.disabled = true;
 
   const messages = [
