@@ -161,11 +161,9 @@
 
     /* ── Glass card base ──────────────────────────────────────────────── */
     .glass {
-      background: var(--glass-bg);
+      background: rgba(10,14,26,0.85);
       border: 1px solid var(--glass-bd);
       border-radius: 20px;
-      backdrop-filter: blur(24px) saturate(160%);
-      -webkit-backdrop-filter: blur(24px) saturate(160%);
       box-shadow:
         0 0 0 1px rgba(255,255,255,.03) inset,
         0 24px 64px rgba(0,0,0,.4);
@@ -536,8 +534,7 @@
     .load-overlay {
       position: absolute;
       inset: 0;
-      background: rgba(3,7,18,.92);
-      backdrop-filter: blur(12px);
+      background: rgba(3,7,18,.96);
       display: flex;
       flex-direction: column;
       align-items: center;
