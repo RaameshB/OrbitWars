@@ -15,16 +15,22 @@ __pycache__/
 # Proprietary Training Code (lives in proprietary/ submodule)
 notebooks/**
 !notebooks/bc_v13_*.ipynb
+!notebooks/bc_v14_*.ipynb
+!notebooks/esn_eval.ipynb
+!notebooks/train_rl.ipynb
 old/
 scripts/train.py
 scripts/train_pgame.py
 scripts/train_backup_*.py
+scripts/train_rl.py
 scripts/verify_behavior.py
 
 # Generated artifacts
 submission/
 submission.tar.gz
-public/
+public/orbit_wars_replay*.html
+public/hof_index.json
+public/replay_meta.json
 
 # Agent notes (local planning docs)
 AGENT_NOTES.md

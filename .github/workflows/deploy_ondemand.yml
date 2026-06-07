@@ -1,12 +1,18 @@
 name: Deploy Simulation
 
 on:
-  push:
-    branches:
-      - main
   repository_dispatch:
     types: [trigger-simulation]
   workflow_dispatch:
+    inputs:
+      players:
+        description: "Number of players (2 or 4)"
+        required: false
+        default: "4"
+      agents:
+        description: "Space-separated agent tags (e.g. 'bc_init iter0099 sniper random')"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -16,6 +22,7 @@ permissions:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -26,43 +33,121 @@ jobs:
           python-version: "3.12"
 
       - name: Install uv
-        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh && echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
-      - name: Pull Latest Checkpoint from R2
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: auto
+      - name: Create venv and install dependencies
         run: |
           uv venv --python 3.12
           source .venv/bin/activate
-          uv pip install awscli
-          mkdir -p /tmp/checkpoints_v7
+          # JAX CPU build + project deps
+          uv pip install "jax[cpu]" flax optax orbax-checkpoint boto3 kaggle-environments
+          # Install remaining project deps if pyproject.toml exists
+          if [ -f pyproject.toml ]; then
+            uv pip install -e . --no-deps 2>/dev/null || true
+          fi
 
-          # Find the latest v7 HoF checkpoint (highest gen number)
-          LATEST_GEN=$(aws s3 ls s3://${{ secrets.R2_BUCKET_NAME }}/v7/ \
-            --endpoint-url ${{ secrets.R2_ENDPOINT_URL }} \
-            | awk '{print $NF}' | grep -E '^hof_[0-9]+/$' \
-            | sed 's/hof_//;s/\///' | sort -n | tail -1)
-          echo "Latest v7 HoF gen: $LATEST_GEN"
-
-          # Pull only the HoF weights and meta — not es_state or rngkey
-          aws s3 sync s3://${{ secrets.R2_BUCKET_NAME }}/v7/hof_${LATEST_GEN}/ \
-            /tmp/checkpoints_v7/hof_${LATEST_GEN}/ \
-            --endpoint-url ${{ secrets.R2_ENDPOINT_URL }}
-          aws s3 cp s3://${{ secrets.R2_BUCKET_NAME }}/v7/meta_${LATEST_GEN}.json \
-            /tmp/checkpoints_v7/meta_${LATEST_GEN}.json \
-            --endpoint-url ${{ secrets.R2_ENDPOINT_URL }} 2>/dev/null || true
-
-      - name: Install Python Dependencies
+      - name: Resolve agents
+        id: resolve
+        env:
+          PLAYERS_DISPATCH: ${{ github.event.client_payload.players }}
+          AGENTS_DISPATCH:  ${{ toJson(github.event.client_payload.agents) }}
+          PLAYERS_MANUAL:   ${{ github.event.inputs.players }}
+          AGENTS_MANUAL:    ${{ github.event.inputs.agents }}
         run: |
-          source .venv/bin/activate
-          uv pip install -r <(uv pip compile pyproject.toml)
+          # Determine number of players
+          PLAYERS="${PLAYERS_DISPATCH:-${PLAYERS_MANUAL:-4}}"
+          echo "players=$PLAYERS" >> $GITHUB_OUTPUT
+
+          # Determine agent list: dispatch sends a JSON array, manual input is a space-separated string
+          if [ -n "$AGENTS_DISPATCH" ] && [ "$AGENTS_DISPATCH" != "null" ]; then
+            # JSON array -> space-separated
+            AGENTS=$(echo "$AGENTS_DISPATCH" | python3 -c "import sys,json; print(' '.join(json.load(sys.stdin)))")
+          elif [ -n "$AGENTS_MANUAL" ]; then
+            AGENTS="$AGENTS_MANUAL"
+          fi
+
+          # If no agents specified or wrong count, fetch top entries from hof_index.json
+          AGENT_COUNT=$(echo "$AGENTS" | wc -w | tr -d ' ')
+          if [ -z "$AGENTS" ] || [ "$AGENT_COUNT" -ne "$PLAYERS" ]; then
+            echo "Agent count mismatch or unset — fetching top HoF entries from R2..."
+            AGENTS=$(python3 - <<'PYEOF'
+          import boto3, json, os, sys
+          s3 = boto3.client(
+              's3',
+              endpoint_url=os.environ['R2_ENDPOINT_URL'],
+              aws_access_key_id=os.environ['AWS_ACCESS_KEY_ID'],
+              aws_secret_access_key=os.environ['AWS_SECRET_ACCESS_KEY'],
+              region_name='auto',
+          )
+          bucket = os.environ['R2_BUCKET_NAME']
+          players = int(os.environ.get('PLAYERS', 4))
+          try:
+              obj = s3.get_object(Bucket=bucket, Key='rl_v20/hof_index.json')
+              idx = json.loads(obj['Body'].read())
+              entries = idx.get('entries_4p' if players == 4 else 'entries_2p', [])
+              entries = sorted(entries, key=lambda e: e['elo'], reverse=True)
+              tags = [e['tag'] for e in entries[:players]]
+              # pad with sniper/random if too few HoF entries
+              builtins = ['sniper', 'random', 'sniper', 'random']
+              while len(tags) < players:
+                  tags.append(builtins[len(tags)])
+              print(' '.join(tags[:players]))
+          except Exception as e:
+              print(f"Warning: {e}", file=sys.stderr)
+              # fallback
+              defaults = ['sniper', 'random', 'sniper', 'random']
+              print(' '.join(defaults[:players]))
+          PYEOF
+          )
+          fi
+
+          echo "agents=$AGENTS" >> $GITHUB_OUTPUT
+          echo "Resolved: players=$PLAYERS agents=$AGENTS"
+        env:
+          R2_ENDPOINT_URL:    ${{ secrets.R2_ENDPOINT_URL }}
+          AWS_ACCESS_KEY_ID:  ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          R2_BUCKET_NAME:     ${{ secrets.R2_BUCKET_NAME }}
+          PLAYERS:            ${{ github.event.client_payload.players || github.event.inputs.players || '4' }}
 
       - name: Generate Replay HTML
+        env:
+          R2_ENDPOINT_URL:       ${{ secrets.R2_ENDPOINT_URL }}
+          AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          R2_BUCKET_NAME:        ${{ secrets.R2_BUCKET_NAME }}
         run: |
           source .venv/bin/activate
-          python scripts/generate_site.py --players ${{ github.event.client_payload.players || '4' }}
+          PLAYERS="${{ steps.resolve.outputs.players }}"
+          AGENTS="${{ steps.resolve.outputs.agents }}"
+          echo "Running: python scripts/generate_site.py --players $PLAYERS --agents $AGENTS"
+          python scripts/generate_site.py --players "$PLAYERS" --agents $AGENTS
+
+      - name: Copy current HoF index into public/
+        env:
+          R2_ENDPOINT_URL:       ${{ secrets.R2_ENDPOINT_URL }}
+          AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          R2_BUCKET_NAME:        ${{ secrets.R2_BUCKET_NAME }}
+        run: |
+          source .venv/bin/activate
+          python3 - <<'PYEOF'
+          import boto3, json, os
+          s3 = boto3.client('s3',
+              endpoint_url=os.environ['R2_ENDPOINT_URL'],
+              aws_access_key_id=os.environ['AWS_ACCESS_KEY_ID'],
+              aws_secret_access_key=os.environ['AWS_SECRET_ACCESS_KEY'],
+              region_name='auto')
+          bucket = os.environ['R2_BUCKET_NAME']
+          try:
+              obj = s3.get_object(Bucket=bucket, Key='rl_v20/hof_index.json')
+              os.makedirs('public', exist_ok=True)
+              with open('public/hof_index.json', 'wb') as f:
+                  f.write(obj['Body'].read())
+              print("Copied hof_index.json to public/")
+          except Exception as e:
+              print(f"Warning: could not copy hof_index.json: {e}")
+          PYEOF
 
       - name: Setup Pages
         uses: actions/configure-pages@v5

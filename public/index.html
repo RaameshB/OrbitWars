@@ -1,267 +1,903 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>OrbitWars AI Visualizer</title>
-    <style>
-        :root {
-            --primary: #6366f1;
-            --primary-hover: #4f46e5;
-            --bg-dark: #0f172a;
-            --glass-bg: rgba(30, 41, 59, 0.7);
-            --glass-border: rgba(255, 255, 255, 0.1);
-        }
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OrbitWars Arena</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <style>
+    /* ── Reset & base ─────────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
-        body {
-            margin: 0;
-            padding: 0;
-            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
-            background-color: var(--bg-dark);
-            color: white;
-            min-height: 100vh;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            background-image: radial-gradient(circle at 50% 0%, #1e1b4b 0%, var(--bg-dark) 50%);
-        }
+    :root {
+      --bg:        #030712;
+      --indigo:    #6366f1;
+      --violet:    #8b5cf6;
+      --cyan:      #22d3ee;
+      --pink:      #e879f9;
+      --gold:      #fbbf24;
+      --silver:    #94a3b8;
+      --bronze:    #c07a3a;
+      --glass-bg:  rgba(255,255,255,0.03);
+      --glass-bd:  rgba(255,255,255,0.07);
+      --glass-hi:  rgba(255,255,255,0.12);
+      --txt:       #e2e8f0;
+      --txt-muted: #475569;
+      --txt-dim:   #1e293b;
 
-        header {
-            margin-top: 3rem;
-            margin-bottom: 2rem;
-            text-align: center;
-        }
+      --slot-0: var(--indigo);
+      --slot-1: var(--violet);
+      --slot-2: var(--cyan);
+      --slot-3: var(--pink);
+    }
 
-        h1 {
-            font-size: 2.5rem;
-            font-weight: 800;
-            margin: 0;
-            background: linear-gradient(to right, #818cf8, #c084fc);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            letter-spacing: -0.05em;
-        }
+    html { scroll-behavior: smooth; }
 
-        p.subtitle {
-            color: #94a3b8;
-            margin-top: 0.5rem;
-            font-size: 1.1rem;
-        }
+    body {
+      font-family: 'Inter', sans-serif;
+      background: var(--bg);
+      color: var(--txt);
+      min-height: 100vh;
+      overflow-x: hidden;
+      position: relative;
+    }
 
-        .controls {
-            display: flex;
-            gap: 1rem;
-            margin-bottom: 2rem;
-            z-index: 10;
-        }
+    /* ── Starfield ────────────────────────────────────────────────────── */
+    body::before {
+      content: '';
+      position: fixed;
+      inset: 0;
+      background-image:
+        radial-gradient(ellipse 80% 50% at 20% 0%,   rgba(99,102,241,.18) 0%, transparent 60%),
+        radial-gradient(ellipse 60% 40% at 80% 10%,  rgba(139,92,246,.14) 0%, transparent 55%),
+        radial-gradient(ellipse 40% 30% at 50% 100%, rgba(34,211,238,.08) 0%, transparent 50%);
+      pointer-events: none;
+      z-index: 0;
+    }
 
-        button {
-            background: var(--glass-bg);
-            border: 1px solid var(--glass-border);
-            color: white;
-            padding: 0.75rem 1.5rem;
-            border-radius: 9999px;
-            font-size: 1rem;
-            font-weight: 600;
-            cursor: pointer;
-            backdrop-filter: blur(10px);
-            transition: all 0.2s ease-in-out;
-            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
-        }
+    /* CSS star field — 200 tiny dots via box-shadow */
+    body::after {
+      content: '';
+      position: fixed;
+      inset: 0;
+      background: transparent;
+      /* Stars generated as box-shadows */
+      box-shadow:
+        42px 17px 1px rgba(255,255,255,.7), 189px 83px 1px rgba(255,255,255,.5),
+        312px 209px 1px rgba(255,255,255,.6), 478px 34px 1px rgba(255,255,255,.4),
+        567px 412px 1px rgba(255,255,255,.7), 623px 178px 1px rgba(255,255,255,.5),
+        734px 89px 1px rgba(255,255,255,.6), 812px 334px 1px rgba(255,255,255,.4),
+        923px 201px 1px rgba(255,255,255,.7), 1067px 45px 1px rgba(255,255,255,.5),
+        1145px 378px 1px rgba(255,255,255,.6), 1234px 112px 1px rgba(255,255,255,.4),
+        1378px 267px 1px rgba(255,255,255,.7), 1456px 489px 1px rgba(255,255,255,.5),
+        67px 289px 1px rgba(255,255,255,.5), 234px 467px 1px rgba(255,255,255,.6),
+        389px 123px 1px rgba(255,255,255,.4), 512px 578px 1px rgba(255,255,255,.7),
+        678px 234px 1px rgba(255,255,255,.5), 789px 456px 1px rgba(255,255,255,.6),
+        890px 345px 1px rgba(255,255,255,.4), 956px 567px 1px rgba(255,255,255,.7),
+        1089px 123px 1px rgba(255,255,255,.5), 1167px 234px 1px rgba(255,255,255,.6),
+        1289px 456px 1px rgba(255,255,255,.4), 1367px 89px 1px rgba(255,255,255,.7),
+        23px 534px 1px rgba(255,255,255,.5), 156px 367px 1px rgba(255,255,255,.6),
+        267px 145px 1px rgba(255,255,255,.4), 423px 678px 1px rgba(255,255,255,.7),
+        534px 289px 1px rgba(255,255,255,.5), 645px 512px 1px rgba(255,255,255,.6),
+        756px 167px 1px rgba(255,255,255,.4), 867px 423px 1px rgba(255,255,255,.7),
+        978px 278px 1px rgba(255,255,255,.5), 1034px 589px 1px rgba(255,255,255,.6),
+        1123px 345px 1px rgba(255,255,255,.4), 1245px 178px 1px rgba(255,255,255,.7),
+        1334px 467px 1px rgba(255,255,255,.5), 1489px 234px 1px rgba(255,255,255,.6),
+        98px 623px 1px rgba(255,255,255,.4), 201px 189px 1px rgba(255,255,255,.7),
+        345px 412px 1px rgba(255,255,255,.5), 456px 56px 1px rgba(255,255,255,.6),
+        589px 345px 1px rgba(255,255,255,.4), 712px 601px 1px rgba(255,255,255,.7),
+        823px 178px 1px rgba(255,255,255,.5), 934px 489px 1px rgba(255,255,255,.6),
+        1078px 267px 1px rgba(255,255,255,.4), 1189px 534px 1px rgba(255,255,255,.7),
+        1312px 123px 1px rgba(255,255,255,.5), 1423px 378px 1px rgba(255,255,255,.6),
+        34px 712px 1px rgba(255,255,255,.4), 178px 523px 1px rgba(255,255,255,.7),
+        289px 334px 1px rgba(255,255,255,.5), 412px 189px 1px rgba(255,255,255,.6),
+        523px 645px 1px rgba(255,255,255,.4), 634px 78px 1px rgba(255,255,255,.7),
+        745px 512px 1px rgba(255,255,255,.5), 856px 267px 1px rgba(255,255,255,.6),
+        967px 423px 1px rgba(255,255,255,.4), 1089px 678px 1px rgba(255,255,255,.7),
+        1201px 145px 1px rgba(255,255,255,.5), 1312px 534px 1px rgba(255,255,255,.6),
+        1434px 312px 1px rgba(255,255,255,.4), 56px 156px 1px rgba(255,255,255,.7),
+        167px 612px 1px rgba(255,255,255,.5), 312px 78px 1px rgba(255,255,255,.6),
+        434px 534px 1px rgba(255,255,255,.4), 578px 189px 1px rgba(255,255,255,.7),
+        689px 678px 1px rgba(255,255,255,.5), 801px 312px 1px rgba(255,255,255,.6),
+        912px 134px 1px rgba(255,255,255,.4), 1056px 489px 1px rgba(255,255,255,.7),
+        1167px 678px 1px rgba(255,255,255,.5), 1278px 234px 1px rgba(255,255,255,.6),
+        1389px 567px 1px rgba(255,255,255,.4), 1478px 89px 1px rgba(255,255,255,.7);
+      pointer-events: none;
+      z-index: 0;
+    }
 
-        button:hover {
-            background: rgba(255, 255, 255, 0.1);
-            transform: translateY(-2px);
-            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 0 15px rgba(99, 102, 241, 0.3);
-            border-color: rgba(255, 255, 255, 0.2);
-        }
+    /* ── Layout wrapper ───────────────────────────────────────────────── */
+    .page {
+      position: relative;
+      z-index: 1;
+      max-width: 1280px;
+      margin: 0 auto;
+      padding: 3rem 2rem 5rem;
+    }
 
-        button:active {
-            transform: translateY(0);
-        }
+    /* ── Header ───────────────────────────────────────────────────────── */
+    header {
+      text-align: center;
+      margin-bottom: 3.5rem;
+      animation: fadeDown .8s ease both;
+    }
 
-        .primary-btn {
-            background: var(--primary);
-            border: none;
-        }
+    .site-title {
+      font-family: 'Orbitron', sans-serif;
+      font-size: clamp(2.4rem, 6vw, 4.5rem);
+      font-weight: 900;
+      letter-spacing: .08em;
+      background: linear-gradient(110deg, var(--indigo) 0%, var(--cyan) 55%, var(--violet) 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      line-height: 1.1;
+      text-shadow: none;
+      position: relative;
+    }
 
-        .primary-btn:hover {
-            background: var(--primary-hover);
-            box-shadow: 0 10px 15px -3px rgba(99, 102, 241, 0.4);
-        }
+    .site-title::after {
+      content: 'ORBITWARS ARENA';
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(110deg, var(--indigo) 0%, var(--cyan) 55%, var(--violet) 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      filter: blur(18px) opacity(.4);
+      pointer-events: none;
+    }
 
-        .glass-container {
-            width: 90%;
-            max-width: 900px;
-            height: 700px;
-            background: var(--glass-bg);
-            border: 1px solid var(--glass-border);
-            border-radius: 24px;
-            overflow: hidden;
-            backdrop-filter: blur(12px);
-            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
-            display: flex;
-            flex-direction: column;
-            position: relative;
-        }
+    .site-subtitle {
+      margin-top: .75rem;
+      font-size: 1rem;
+      font-weight: 300;
+      letter-spacing: .18em;
+      text-transform: uppercase;
+      color: var(--txt-muted);
+    }
 
-        iframe {
-            width: 100%;
-            height: 100%;
-            border: none;
-            background: #ffffff; /* Kaggle env is typically light mode */
-        }
+    /* ── Glass card base ──────────────────────────────────────────────── */
+    .glass {
+      background: var(--glass-bg);
+      border: 1px solid var(--glass-bd);
+      border-radius: 20px;
+      backdrop-filter: blur(24px) saturate(160%);
+      -webkit-backdrop-filter: blur(24px) saturate(160%);
+      box-shadow:
+        0 0 0 1px rgba(255,255,255,.03) inset,
+        0 24px 64px rgba(0,0,0,.4);
+      overflow: hidden;
+    }
 
-        /* Loading Overlay */
-        .loading-overlay {
-            position: absolute;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: rgba(15, 23, 42, 0.85);
-            backdrop-filter: blur(8px);
-            display: flex;
-            flex-direction: column;
-            justify-content: center;
-            align-items: center;
-            opacity: 0;
-            pointer-events: none;
-            transition: opacity 0.3s ease;
-            z-index: 20;
-        }
+    /* ── Main grid ────────────────────────────────────────────────────── */
+    .main-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1.5rem;
+      margin-bottom: 1.5rem;
+      animation: fadeUp .8s .15s ease both;
+    }
 
-        .loading-overlay.active {
-            opacity: 1;
-            pointer-events: all;
-        }
+    @media (max-width: 860px) {
+      .main-grid { grid-template-columns: 1fr; }
+    }
 
-        .spinner {
-            width: 50px;
-            height: 50px;
-            border: 4px solid rgba(99, 102, 241, 0.3);
-            border-radius: 50%;
-            border-top-color: var(--primary);
-            animation: spin 1s ease-in-out infinite;
-            margin-bottom: 1.5rem;
-        }
+    /* ── Panel header ─────────────────────────────────────────────────── */
+    .panel-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 1.25rem 1.5rem 0;
+    }
 
-        .progress-bar-container {
-            width: 60%;
-            height: 8px;
-            background: rgba(255, 255, 255, 0.1);
-            border-radius: 9999px;
-            overflow: hidden;
-            margin-top: 1rem;
-        }
+    .panel-title {
+      font-family: 'Orbitron', sans-serif;
+      font-size: .7rem;
+      font-weight: 700;
+      letter-spacing: .2em;
+      text-transform: uppercase;
+      color: var(--txt-muted);
+    }
 
-        .progress-bar {
-            height: 100%;
-            width: 0%;
-            background: linear-gradient(to right, #6366f1, #a855f7);
-            border-radius: 9999px;
-            transition: width 1s linear;
-        }
+    /* ── Tabs ─────────────────────────────────────────────────────────── */
+    .tabs {
+      display: flex;
+      gap: .375rem;
+      padding: 1rem 1.5rem .75rem;
+    }
 
-        .loading-text {
-            font-size: 1.2rem;
-            font-weight: 600;
-            color: #e2e8f0;
-        }
+    .tab {
+      padding: .35rem .9rem;
+      border-radius: 9999px;
+      border: 1px solid var(--glass-bd);
+      background: transparent;
+      color: var(--txt-muted);
+      font-family: 'Inter', sans-serif;
+      font-size: .78rem;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all .2s ease;
+      white-space: nowrap;
+    }
 
-        @keyframes spin {
-            to { transform: rotate(360deg); }
-        }
-    </style>
+    .tab:hover { color: var(--txt); border-color: var(--glass-hi); }
+
+    .tab.active {
+      background: rgba(99,102,241,.2);
+      border-color: rgba(99,102,241,.5);
+      color: #a5b4fc;
+    }
+
+    /* ── Leaderboard ──────────────────────────────────────────────────── */
+    .lb-list {
+      padding: .25rem 1.5rem 1.5rem;
+      display: flex;
+      flex-direction: column;
+      gap: .5rem;
+      max-height: 420px;
+      overflow-y: auto;
+      scrollbar-width: thin;
+      scrollbar-color: rgba(99,102,241,.3) transparent;
+    }
+
+    .lb-row {
+      display: grid;
+      grid-template-columns: 2.2rem 1fr auto;
+      align-items: center;
+      gap: .75rem;
+      padding: .6rem .75rem;
+      border-radius: 10px;
+      border: 1px solid transparent;
+      transition: background .2s, border-color .2s;
+      animation: fadeIn .4s ease both;
+    }
+
+    .lb-row:hover {
+      background: rgba(255,255,255,.04);
+      border-color: var(--glass-bd);
+    }
+
+    .rank-badge {
+      width: 2rem;
+      height: 2rem;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: .72rem;
+      font-weight: 500;
+      flex-shrink: 0;
+    }
+
+    .rank-1 { background: rgba(251,191,36,.15); color: var(--gold);   border: 1px solid rgba(251,191,36,.3); }
+    .rank-2 { background: rgba(148,163,184,.12); color: var(--silver); border: 1px solid rgba(148,163,184,.25); }
+    .rank-3 { background: rgba(192,122,58,.12);  color: var(--bronze); border: 1px solid rgba(192,122,58,.25); }
+    .rank-n { background: rgba(255,255,255,.04); color: var(--txt-muted); border: 1px solid var(--glass-bd); }
+
+    .lb-info { min-width: 0; }
+
+    .lb-tag {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: .82rem;
+      font-weight: 500;
+      color: var(--txt);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .lb-bar-wrap {
+      height: 3px;
+      background: rgba(255,255,255,.06);
+      border-radius: 9999px;
+      margin-top: .35rem;
+      overflow: hidden;
+    }
+
+    .lb-bar {
+      height: 100%;
+      border-radius: 9999px;
+      background: linear-gradient(90deg, var(--indigo), var(--cyan));
+      transition: width 1s cubic-bezier(.4,0,.2,1);
+    }
+
+    .lb-elo {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: .82rem;
+      font-weight: 500;
+      color: #a5b4fc;
+      white-space: nowrap;
+    }
+
+    .lb-footer {
+      padding: .75rem 1.5rem 1rem;
+      border-top: 1px solid var(--glass-bd);
+      font-size: .72rem;
+      color: var(--txt-muted);
+      font-family: 'JetBrains Mono', monospace;
+      display: flex;
+      align-items: center;
+      gap: .5rem;
+    }
+
+    .lb-footer::before {
+      content: '';
+      display: inline-block;
+      width: 6px; height: 6px;
+      border-radius: 50%;
+      background: #22c55e;
+      box-shadow: 0 0 6px #22c55e;
+      animation: pulse-dot 2s infinite;
+    }
+
+    /* ── Skeleton ─────────────────────────────────────────────────────── */
+    .skeleton {
+      background: linear-gradient(90deg,
+        rgba(255,255,255,.04) 0%,
+        rgba(255,255,255,.09) 50%,
+        rgba(255,255,255,.04) 100%);
+      background-size: 200% 100%;
+      border-radius: 8px;
+      animation: shimmer 1.4s infinite;
+    }
+
+    .skel-row {
+      height: 3rem;
+      border-radius: 10px;
+      margin-bottom: .5rem;
+    }
+
+    /* ── Match Setup ──────────────────────────────────────────────────── */
+    .setup-body { padding: .5rem 1.5rem 1.5rem; }
+
+    .mode-toggle {
+      display: flex;
+      gap: .375rem;
+      margin-bottom: 1.25rem;
+    }
+
+    .mode-btn {
+      flex: 1;
+      padding: .5rem;
+      border-radius: 9999px;
+      border: 1px solid var(--glass-bd);
+      background: transparent;
+      color: var(--txt-muted);
+      font-family: 'Orbitron', sans-serif;
+      font-size: .65rem;
+      font-weight: 700;
+      letter-spacing: .12em;
+      cursor: pointer;
+      transition: all .25s ease;
+    }
+
+    .mode-btn:hover { color: var(--txt); }
+
+    .mode-btn.active {
+      background: linear-gradient(135deg, rgba(99,102,241,.3), rgba(139,92,246,.25));
+      border-color: rgba(99,102,241,.6);
+      color: #c7d2fe;
+      box-shadow: 0 0 20px rgba(99,102,241,.2);
+    }
+
+    /* ── Slot cards ───────────────────────────────────────────────────── */
+    .slots-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: .75rem;
+      margin-bottom: 1.25rem;
+    }
+
+    .slot-card {
+      border-radius: 12px;
+      border: 1px solid var(--glass-bd);
+      background: rgba(255,255,255,.025);
+      padding: .75rem;
+      transition: border-color .2s, box-shadow .2s;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .slot-card::before {
+      content: '';
+      position: absolute;
+      top: 0; left: 0; right: 0;
+      height: 2px;
+      background: var(--slot-color);
+      opacity: .8;
+    }
+
+    .slot-card:hover {
+      border-color: color-mix(in srgb, var(--slot-color) 40%, transparent);
+      box-shadow: 0 0 16px color-mix(in srgb, var(--slot-color) 15%, transparent);
+    }
+
+    .slot-label {
+      font-family: 'Orbitron', sans-serif;
+      font-size: .58rem;
+      font-weight: 700;
+      letter-spacing: .18em;
+      text-transform: uppercase;
+      color: var(--slot-color);
+      margin-bottom: .5rem;
+      opacity: .9;
+    }
+
+    .slot-select {
+      width: 100%;
+      background: rgba(0,0,0,.35);
+      border: 1px solid rgba(255,255,255,.08);
+      border-radius: 8px;
+      color: var(--txt);
+      font-family: 'JetBrains Mono', monospace;
+      font-size: .78rem;
+      padding: .45rem .6rem;
+      cursor: pointer;
+      outline: none;
+      transition: border-color .2s;
+      -webkit-appearance: none;
+      appearance: none;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%2364748b'/%3E%3C/svg%3E");
+      background-repeat: no-repeat;
+      background-position: right .6rem center;
+      padding-right: 1.8rem;
+    }
+
+    .slot-select:focus { border-color: var(--slot-color); }
+
+    .slot-select option {
+      background: #0f172a;
+      color: var(--txt);
+    }
+
+    /* ── Run button ───────────────────────────────────────────────────── */
+    .run-wrap {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: .5rem;
+    }
+
+    .run-btn {
+      width: 100%;
+      padding: .85rem;
+      border-radius: 12px;
+      border: none;
+      background: linear-gradient(135deg, var(--indigo), var(--violet));
+      color: white;
+      font-family: 'Orbitron', sans-serif;
+      font-size: .72rem;
+      font-weight: 700;
+      letter-spacing: .15em;
+      cursor: pointer;
+      transition: all .25s ease;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .run-btn::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(135deg, rgba(255,255,255,.1) 0%, transparent 60%);
+      border-radius: inherit;
+    }
+
+    .run-btn:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 8px 32px rgba(99,102,241,.45), 0 0 0 1px rgba(99,102,241,.3);
+    }
+
+    .run-btn:active { transform: translateY(0); }
+
+    .run-btn:disabled {
+      opacity: .45;
+      cursor: not-allowed;
+      transform: none;
+      box-shadow: none;
+    }
+
+    .run-hint {
+      font-size: .7rem;
+      color: var(--txt-muted);
+      letter-spacing: .05em;
+    }
+
+    /* ── Replay section ───────────────────────────────────────────────── */
+    .replay-section {
+      animation: fadeUp .8s .3s ease both;
+      display: none;
+    }
+
+    .replay-section.visible {
+      display: block;
+      animation: slideDown .6s ease both;
+    }
+
+    .replay-inner {
+      position: relative;
+      border-radius: 20px;
+      overflow: hidden;
+      height: 680px;
+    }
+
+    .replay-iframe {
+      width: 100%;
+      height: 100%;
+      border: none;
+      display: block;
+    }
+
+    /* ── Loading overlay ──────────────────────────────────────────────── */
+    .load-overlay {
+      position: absolute;
+      inset: 0;
+      background: rgba(3,7,18,.92);
+      backdrop-filter: blur(12px);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 1.5rem;
+      z-index: 10;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity .3s ease;
+    }
+
+    .load-overlay.active {
+      opacity: 1;
+      pointer-events: all;
+    }
+
+    .loader-ring {
+      width: 56px; height: 56px;
+      border-radius: 50%;
+      border: 3px solid rgba(99,102,241,.2);
+      border-top-color: var(--indigo);
+      animation: spin 1s linear infinite;
+    }
+
+    .load-text {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: .88rem;
+      color: #a5b4fc;
+      text-align: center;
+      transition: opacity .3s ease;
+    }
+
+    .load-subtext {
+      font-size: .72rem;
+      color: var(--txt-muted);
+      text-align: center;
+    }
+
+    .progress-track {
+      width: 280px;
+      height: 4px;
+      background: rgba(255,255,255,.07);
+      border-radius: 9999px;
+      overflow: hidden;
+    }
+
+    .progress-fill {
+      height: 100%;
+      background: linear-gradient(90deg, var(--indigo), var(--cyan));
+      border-radius: 9999px;
+      width: 0%;
+      transition: width 1s linear;
+    }
+
+    /* ── Animations ───────────────────────────────────────────────────── */
+    @keyframes fadeDown  { from { opacity:0; transform:translateY(-20px) } to { opacity:1; transform:none } }
+    @keyframes fadeUp    { from { opacity:0; transform:translateY(24px)  } to { opacity:1; transform:none } }
+    @keyframes fadeIn    { from { opacity:0 } to { opacity:1 } }
+    @keyframes shimmer   { 0%,100% { background-position:200% 0 } 50% { background-position:0% 0 } }
+    @keyframes spin      { to { transform:rotate(360deg) } }
+    @keyframes slideDown { from { opacity:0; transform:translateY(-16px) } to { opacity:1; transform:none } }
+    @keyframes pulse-dot { 0%,100% { opacity:1 } 50% { opacity:.3 } }
+  </style>
 </head>
 <body>
+<div class="page">
 
-    <header>
-        <h1>OrbitWars AI Dashboard</h1>
-        <p class="subtitle">Live continuous monitoring of the TPU Reinforcement Learning Cluster</p>
-    </header>
+  <!-- Header -->
+  <header>
+    <div class="site-title">ORBITWARS ARENA</div>
+    <p class="site-subtitle">Autonomous AI agents compete for galactic dominance</p>
+  </header>
 
-    <div class="controls">
-        <button class="primary-btn" onclick="triggerSimulation(2)">🚀 Generate 2-Way Sim</button>
-        <button class="primary-btn" onclick="triggerSimulation(4)">🌌 Generate 4-Way Sim</button>
+  <!-- Main two-column grid -->
+  <div class="main-grid">
+
+    <!-- Leaderboard -->
+    <div class="glass" id="lbPanel">
+      <div class="panel-header">
+        <span class="panel-title">Hall of Fame</span>
+      </div>
+      <div class="tabs">
+        <button class="tab active" onclick="switchLbTab('2p', this)">2P Rankings</button>
+        <button class="tab"        onclick="switchLbTab('4p', this)">4P Rankings</button>
+      </div>
+      <div class="lb-list" id="lbList">
+        <!-- Skeleton rows while loading -->
+        <div class="skeleton skel-row"></div>
+        <div class="skeleton skel-row" style="opacity:.8"></div>
+        <div class="skeleton skel-row" style="opacity:.6"></div>
+        <div class="skeleton skel-row" style="opacity:.4"></div>
+        <div class="skeleton skel-row" style="opacity:.25"></div>
+      </div>
+      <div class="lb-footer" id="lbFooter">Fetching rankings…</div>
     </div>
 
-    <div class="glass-container">
-        <!-- The overlay that shows when compiling -->
-        <div class="loading-overlay" id="loadingOverlay">
-            <div class="spinner"></div>
-            <div class="loading-text" id="loadingText">Compiling JAX XLA Graphs...</div>
-            <div class="progress-bar-container">
-                <div class="progress-bar" id="progressBar"></div>
-            </div>
-            <p style="color: #94a3b8; font-size: 0.9rem; margin-top: 1rem;">This process takes approximately 3 minutes.</p>
+    <!-- Match Setup -->
+    <div class="glass" id="setupPanel">
+      <div class="panel-header">
+        <span class="panel-title">Match Configuration</span>
+      </div>
+      <div class="setup-body">
+        <div class="mode-toggle">
+          <button class="mode-btn active" onclick="setMode(2, this)">2P · 1v1</button>
+          <button class="mode-btn"        onclick="setMode(4, this)">4P · FFA</button>
         </div>
-        
-        <!-- The actual Kaggle HTML Replay -->
-        <iframe id="replayFrame" src="orbit_wars_replay.html" title="OrbitWars Simulation"></iframe>
+        <div class="slots-grid" id="slotsGrid">
+          <!-- filled by JS -->
+        </div>
+        <div class="run-wrap">
+          <button class="run-btn" id="runBtn" onclick="runSimulation()">
+            ⬡ &nbsp;LAUNCH SIMULATION
+          </button>
+          <span class="run-hint">~3 min compile · JAX XLA on TPU</span>
+        </div>
+      </div>
     </div>
 
-    <script>
-        // Update this URL with your actual Cloudflare Worker URL once deployed
-        const CLOUDFLARE_WORKER_URL = 'https://orbit-wars-gateway.raameshb.workers.dev/';
+  </div><!-- /main-grid -->
 
-        async function triggerSimulation(players) {
-            const overlay = document.getElementById('loadingOverlay');
-            const progressBar = document.getElementById('progressBar');
-            const loadingText = document.getElementById('loadingText');
-            
-            // Show loading UI
-            overlay.classList.add('active');
-            progressBar.style.width = '0%';
-            
-            try {
-                // Send request to Cloudflare API Gateway
-                const response = await fetch(CLOUDFLARE_WORKER_URL, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify({ players: players })
-                });
+  <!-- Replay -->
+  <div class="glass replay-section" id="replaySection">
+    <div class="panel-header" style="padding-bottom:.75rem;">
+      <span class="panel-title">Live Replay</span>
+    </div>
+    <div class="replay-inner">
+      <div class="load-overlay active" id="loadOverlay">
+        <div class="loader-ring"></div>
+        <div class="load-text" id="loadText">Initialising JAX XLA graphs…</div>
+        <div class="progress-track"><div class="progress-fill" id="progFill"></div></div>
+        <div class="load-subtext" id="loadSubtext">Simulation results will appear here</div>
+      </div>
+      <iframe class="replay-iframe" id="replayFrame" title="OrbitWars Replay"></iframe>
+    </div>
+  </div>
 
-                if (!response.ok) {
-                    throw new Error('Failed to trigger GitHub Action');
-                }
+</div><!-- /page -->
 
-                // Start fake progress bar for ~3 minutes (180 seconds)
-                let progress = 0;
-                loadingText.innerText = `Simulating ${players}-Way Free-For-All...`;
-                
-                const interval = setInterval(() => {
-                    progress += (100 / 180); // Fills up over 180 seconds
-                    
-                    if (progress >= 30 && progress < 60) loadingText.innerText = "Downloading latest R2 checkpoints...";
-                    if (progress >= 60 && progress < 90) loadingText.innerText = "Executing physics engine rollout...";
-                    if (progress >= 90 && progress < 120) loadingText.innerText = "Rendering interactive HTML...";
-                    if (progress >= 120 && progress < 180) loadingText.innerText = "Deploying to GitHub Pages...";
+<script>
+/* ── Config ───────────────────────────────────────────────────────────── */
+const WORKER = 'https://orbit-wars-gateway.raameshb.workers.dev';
+const SLOT_COLORS = ['var(--indigo)', 'var(--violet)', 'var(--cyan)', 'var(--pink)'];
+const SLOT_NAMES  = ['Player 1', 'Player 2', 'Player 3', 'Player 4'];
 
-                    if (progress >= 100) {
-                        clearInterval(interval);
-                        progressBar.style.width = '100%';
-                        
-                        // Wait a few extra seconds for GitHub pages to finish caching
-                        setTimeout(() => {
-                            document.getElementById('replayFrame').src = 'orbit_wars_replay.html?t=' + new Date().getTime(); // cache bust
-                            overlay.classList.remove('active');
-                        }, 5000);
-                    } else {
-                        progressBar.style.width = `${progress}%`;
-                    }
-                }, 1000);
+/* ── State ────────────────────────────────────────────────────────────── */
+let hofData = null;
+let currentMode = 2;
+let activeLbTab = '2p';
 
-            } catch (error) {
-                console.error(error);
-                loadingText.innerText = "Error: Failed to connect to API Gateway.";
-                setTimeout(() => {
-                    overlay.classList.remove('active');
-                }, 3000);
-            }
-        }
-    </script>
+/* ── Fetch HoF index — worker first, same-origin fallback ────────────── */
+async function fetchHoF() {
+  const sources = [
+    () => fetch(`${WORKER}/hof-index`, { cache: 'no-store' }),
+    () => fetch('hof_index.json',      { cache: 'no-store' }),
+  ];
+  for (const src of sources) {
+    try {
+      const res = await src();
+      if (!res.ok) continue;
+      hofData = await res.json();
+      renderLeaderboard();
+      populateSelects();
+      return;
+    } catch (_) {}
+  }
+  document.getElementById('lbFooter').textContent = 'Rankings unavailable.';
+  document.getElementById('lbList').innerHTML =
+    '<div style="padding:.5rem 0;color:var(--txt-muted);font-size:.8rem;text-align:center">No data found.</div>';
+}
+
+/* ── Fetch last replay metadata ───────────────────────────────────────── */
+async function fetchLastMatch() {
+  try {
+    const res = await fetch('replay_meta.json', { cache: 'no-store' });
+    if (!res.ok) return;
+    const meta = await res.json();
+    if (!meta.labels) return;
+    const sub = document.getElementById('loadSubtext');
+    if (sub) sub.textContent =
+      `Last: ${meta.labels.join(' vs ')} · ${new Date(meta.generated_at * 1000).toLocaleString()}`;
+  } catch (_) {}
+}
+
+/* ── Leaderboard ──────────────────────────────────────────────────────── */
+function switchLbTab(tab, el) {
+  activeLbTab = tab;
+  document.querySelectorAll('.tabs .tab').forEach(t => t.classList.remove('active'));
+  el.classList.add('active');
+  renderLeaderboard();
+}
+
+function renderLeaderboard() {
+  if (!hofData) return;
+  const entries = activeLbTab === '2p' ? hofData.entries_2p : hofData.entries_4p;
+  if (!entries || !entries.length) {
+    document.getElementById('lbList').innerHTML =
+      '<div style="padding:.5rem 0;color:var(--txt-muted);font-size:.8rem;text-align:center">No entries yet.</div>';
+    return;
+  }
+
+  const sorted = [...entries].sort((a,b) => b.elo - a.elo);
+  const eloMin = sorted[sorted.length - 1].elo;
+  const eloMax = sorted[0].elo;
+  const eloRange = Math.max(eloMax - eloMin, 1);
+
+  const list = document.getElementById('lbList');
+  list.innerHTML = sorted.map((e, i) => {
+    const rank = i + 1;
+    const cls = rank === 1 ? 'rank-1' : rank === 2 ? 'rank-2' : rank === 3 ? 'rank-3' : 'rank-n';
+    const pct = ((e.elo - eloMin) / eloRange * 100).toFixed(1);
+    return `
+      <div class="lb-row" style="animation-delay:${i * 40}ms">
+        <div class="rank-badge ${cls}">${rank <= 3 ? ['★','▲','◆'][rank-1] : rank}</div>
+        <div class="lb-info">
+          <div class="lb-tag">${e.tag}</div>
+          <div class="lb-bar-wrap"><div class="lb-bar" data-pct="${pct}" style="width:0%"></div></div>
+        </div>
+        <div class="lb-elo">${Math.round(e.elo)}</div>
+      </div>`;
+  }).join('');
+
+  // Animate bars on next frame
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    list.querySelectorAll('.lb-bar').forEach(bar => {
+      bar.style.width = bar.dataset.pct + '%';
+    });
+  }));
+
+  const date = hofData.timestamp ? new Date(hofData.timestamp * 1000).toLocaleString() : '—';
+  document.getElementById('lbFooter').textContent =
+    `Updated iter ${hofData.iter ?? '?'} · ${date}`;
+}
+
+/* ── Slot grid ────────────────────────────────────────────────────────── */
+function setMode(n, el) {
+  currentMode = n;
+  document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));
+  el.classList.add('active');
+  buildSlots();
+}
+
+function buildSlots() {
+  const grid = document.getElementById('slotsGrid');
+  grid.style.gridTemplateColumns = currentMode === 2 ? '1fr 1fr' : '1fr 1fr';
+  grid.innerHTML = Array.from({length: currentMode}, (_, i) => `
+    <div class="slot-card" style="--slot-color:${SLOT_COLORS[i]}">
+      <div class="slot-label">${SLOT_NAMES[i]}</div>
+      <select class="slot-select" id="slot${i}"></select>
+    </div>`).join('');
+  populateSelects();
+}
+
+function populateSelects() {
+  // Use the mode-matching HoF list for defaults
+  const modeKey = currentMode === 2 ? 'entries_2p' : 'entries_4p';
+  const rawEntries = hofData?.[modeKey] ?? hofData?.entries_2p ?? [];
+  const sorted = [...rawEntries].sort((a,b) => b.elo - a.elo);
+
+  for (let i = 0; i < currentMode; i++) {
+    const sel = document.getElementById(`slot${i}`);
+    if (!sel) continue;
+
+    const hofOpts = sorted.map(e =>
+      `<option value="${e.tag}">${e.tag} (${Math.round(e.elo)})</option>`
+    ).join('');
+
+    sel.innerHTML = hofOpts +
+      `<option disabled>────────────</option>` +
+      `<option value="sniper">Sniper (rule-based)</option>` +
+      `<option value="random">Random agent</option>`;
+
+    // Default: slot i → i-th HoF entry, wrapping around; fallback to builtins
+    const fallbacks = ['sniper', 'random', 'sniper', 'random'];
+    if (sorted.length > 0) {
+      sel.value = sorted[i % sorted.length]?.tag ?? fallbacks[i];
+    } else {
+      sel.value = fallbacks[i];
+    }
+  }
+}
+
+/* ── Run simulation ───────────────────────────────────────────────────── */
+async function runSimulation() {
+  const btn = document.getElementById('runBtn');
+  const agents = Array.from({length: currentMode}, (_, i) => {
+    const s = document.getElementById(`slot${i}`);
+    return s ? s.value : 'random';
+  });
+
+  // Show replay section
+  const section = document.getElementById('replaySection');
+  section.style.display = 'block';
+  section.classList.add('visible');
+  section.scrollIntoView({ behavior: 'smooth', block: 'start' });
+
+  // Start loading overlay
+  const overlay = document.getElementById('loadOverlay');
+  const fill    = document.getElementById('progFill');
+  const txt     = document.getElementById('loadText');
+  const sub     = document.getElementById('loadSubtext');
+  overlay.classList.add('active');
+  fill.style.width = '0%';
+  txt.textContent = 'Dispatching to GitHub Actions…';
+  sub.textContent = 'Compiling JAX XLA graphs on TPU';
+  btn.disabled = true;
+
+  const messages = [
+    [5,  'Downloading R2 checkpoint weights…'],
+    [20, 'Compiling JAX XLA graphs on TPU…'],
+    [45, 'Executing physics engine rollout…'],
+    [70, 'Rendering interactive replay…'],
+    [88, 'Deploying to GitHub Pages…'],
+    [96, 'Waiting for CDN propagation…'],
+  ];
+
+  try {
+    const res = await fetch(WORKER, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ players: currentMode, agents })
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  } catch (e) {
+    txt.textContent = '⚠ Failed to contact API gateway.';
+    sub.textContent = e.message;
+    btn.disabled = false;
+    return;
+  }
+
+  // Fake progress over ~185s
+  let progress = 0;
+  const total = 185;
+  const interval = setInterval(() => {
+    progress = Math.min(progress + (100 / total), 99);
+    fill.style.width = progress + '%';
+    const msg = messages.filter(([p]) => progress >= p).pop();
+    if (msg) txt.textContent = msg[1];
+    if (progress >= 99) clearInterval(interval);
+  }, 1000);
+
+  // Poll for completion (try after ~3min)
+  await new Promise(r => setTimeout(r, 180_000));
+  clearInterval(interval);
+  fill.style.width = '100%';
+  txt.textContent = 'Replay ready!';
+
+  setTimeout(() => {
+    const frame = document.getElementById('replayFrame');
+    frame.src = 'orbit_wars_replay.html?t=' + Date.now();
+    frame.onload = () => {
+      overlay.classList.remove('active');
+      btn.disabled = false;
+    };
+  }, 2000);
+}
+
+/* ── Boot ─────────────────────────────────────────────────────────────── */
+buildSlots();     // build UI immediately with empty selects
+fetchHoF();       // then fetch and populate
+fetchLastMatch(); // show last replay participants in replay panel subtext
+</script>
 </body>
 </html>

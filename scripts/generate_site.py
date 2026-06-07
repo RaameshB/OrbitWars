@@ -1,815 +1,249 @@
-import os, glob, sys, argparse, functools, json, re
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+"""Generate an HTML replay for a custom agent matchup.
 
+Usage (from project root):
+    python scripts/generate_site.py --players 4 --agents bc_init iter0099 sniper random
+
+Agent identifiers:
+    sniper   — rule-based nearest-sniper (pure JAX)
+    random   — random agent (pure JAX)
+    <tag>    — HoF agent tag (downloaded from R2 as rl_v20/hof/{mode}/{tag}.pkl)
+"""
+import argparse, os, sys, pickle, functools, json, time
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+try:
+    from dotenv import load_dotenv; load_dotenv()
+except ImportError:
+    pass
+
+import numpy as np
 import jax
 import jax.numpy as jnp
+import jax.random as jr
 from flax import nnx
-import orbax.checkpoint as ocp
 from jax.tree_util import tree_map
+import boto3
 
 from core.networks import Actor, logits_to_action
-from core.orbit_wars_jax import setup, step, EnvAction, MAX_FLEETS, MAX_COMET_PATH_LEN
-from core.rollout_utils import calculate_intercept_angle, build_obs_arrays
+from core.orbit_wars_jax import setup, step, EnvAction, MAX_BODIES, MAX_FLEETS
+from core.rollout_utils import calculate_intercept_angle, build_obs_arrays, active_body_mask
 from scripts.jax_visualizer import jax_states_to_kaggle_env
 
+# ── Constants ──────────────────────────────────────────────────────────────────
+HIDDEN_DIM    = 48
+NUM_SA_LAYERS = 6
+MAX_TARGETS   = 64          # 60 planet/comet slots + 4 DS slots
+R2_PREFIX     = 'rl_v20'
+PLAYER_COLORS = ['#0072B2', '#D55E00', '#009E73', '#F0E442']
+BUILTIN_TAGS  = {'sniper', 'random'}
+
+# ── Args ───────────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser()
-parser.add_argument('--players', type=int, default=4, help='Number of players in the simulation')
+parser.add_argument('--players', type=int, default=4)
+parser.add_argument('--agents',  nargs='+', required=True)
 args = parser.parse_args()
 
-HOF_ARCHIVE_SIZE = 34
-HOF_EXPLOIT_SIZE = 16
-HOF_SIZE = HOF_ARCHIVE_SIZE + HOF_EXPLOIT_SIZE
+num_players = args.players
+assert len(args.agents) == num_players, \
+    f"Expected {num_players} agents, got {len(args.agents)}: {args.agents}"
+print(f"Generating {num_players}-player replay: {args.agents}")
 
-# Wong colorblind-safe palette — must match jax_visualizer.py
-PLAYER_COLORS = ['#0072B2', '#D55E00', '#009E73', '#F0E442']
-
-CLOUDFLARE_WORKER_URL = 'https://orbit-wars-gateway.raameshb.workers.dev/'
-
-print(f"Starting {args.players}-Way HTML Site Generation...")
-
-import time as _time
-dummy_key = jax.random.PRNGKey(int(_time.time()))
-actor_nnx = Actor(hidden_dim=32, num_sa_layers=6, rngs=nnx.Rngs(0))
-actor_graph, actor_params_template = nnx.split(actor_nnx)
-
-checkpointer = ocp.PyTreeCheckpointer()
-
-# HoF template: [HOF_SIZE, ...] pytree
-hof_template = jax.tree_util.tree_map(
-    lambda x: jnp.zeros((HOF_SIZE, *x.shape), dtype=x.dtype), actor_params_template
+# ── R2 client (uses env vars set by GitHub Actions secrets) ───────────────────
+s3 = boto3.client(
+    's3',
+    endpoint_url=os.environ['R2_ENDPOINT_URL'],
+    aws_access_key_id=os.environ['AWS_ACCESS_KEY_ID'],
+    aws_secret_access_key=os.environ['AWS_SECRET_ACCESS_KEY'],
+    region_name='auto',
 )
+bucket = os.environ['R2_BUCKET_NAME']
 
-top4_params  = None
-exploit_params = None
+# ── Actor graph template ───────────────────────────────────────────────────────
+_proto = Actor(hidden_dim=HIDDEN_DIM, num_sa_layers=NUM_SA_LAYERS, rngs=nnx.Rngs(0))
+actor_graph, _ = nnx.split(_proto)
 
-# ── Find latest v7 HoF checkpoint ────────────────────────────────────────────
-hof_dirs = glob.glob('/tmp/checkpoints_v7/hof_*')
-hof_gens = []
-for d in hof_dirs:
-    m = re.match(r'.*/hof_(\d+)$', d)
-    if m:
-        hof_gens.append((int(m.group(1)), d))
+def np_to_params(np_dict):
+    return jax.tree_util.tree_map(jnp.array, np_dict)
 
-if hof_gens:
-    latest_gen, latest_hof = max(hof_gens, key=lambda x: x[0])
-    print(f'Loading v7 HoF from {latest_hof} (gen {latest_gen})...')
+# ── Load a HoF agent from R2 ───────────────────────────────────────────────────
+def load_hof_actor(tag):
+    # Prefer the mode matching the game type; fall back to the other.
+    modes = ['2p', '4p'] if num_players == 2 else ['4p', '2p']
+    for mode in modes:
+        key = f'{R2_PREFIX}/hof/{mode}/{tag}.pkl'
+        local = f'/tmp/hof_agent_{tag}.pkl'
+        try:
+            print(f'  Downloading {key} ...')
+            s3.download_file(bucket, key, local)
+            with open(local, 'rb') as f:
+                raw = pickle.load(f)
+            params_np = raw['params'] if isinstance(raw, dict) and 'params' in raw else raw
+            return nnx.merge(actor_graph, np_to_params(params_np))
+        except Exception as e:
+            print(f'  Not found in {mode}: {e}')
+    raise RuntimeError(f'Could not load agent "{tag}" from R2 in any mode.')
 
-    restore_args = ocp.checkpoint_utils.construct_restore_args(hof_template)
-    try:
-        hof_params = checkpointer.restore(latest_hof, item=hof_template, restore_args=restore_args)
+# ── Build per-player agent list ────────────────────────────────────────────────
+actors = []
+agent_labels = []
+for tag in args.agents:
+    if tag in BUILTIN_TAGS:
+        actors.append(tag)
+        agent_labels.append(tag.title())
+    else:
+        actors.append(load_hof_actor(tag))
+        agent_labels.append(tag)
+print("Agents ready:", agent_labels)
 
-        # Read meta to know how many agents are actually filled and where the pointer is
-        meta_path = f'/tmp/checkpoints_v7/meta_{latest_gen}.json'
-        hof_archive_ptr = HOF_ARCHIVE_SIZE
-        hof_filled      = HOF_SIZE
-        hof_exploit_ptr = HOF_EXPLOIT_SIZE
-        if os.path.exists(meta_path):
-            with open(meta_path) as f:
-                meta = json.load(f)
-            hof_archive_ptr = meta.get('hof_archive_ptr', HOF_ARCHIVE_SIZE)
-            hof_filled      = meta.get('hof_filled',      HOF_SIZE)
-            hof_exploit_ptr = meta.get('hof_exploit_ptr', HOF_EXPLOIT_SIZE)
+# ── Rule-based JAX agents ──────────────────────────────────────────────────────
+# These are called inside lax.scan so must be pure JAX.
+# `pid` is a static Python int (loop variable), so partial-application is fine.
 
-        # Pick 4 most-recently-added archive agents for the main replays
-        n_arch = min(hof_filled, HOF_ARCHIVE_SIZE)
-        arch_slots = [(hof_archive_ptr - 1 - i) % HOF_ARCHIVE_SIZE for i in range(min(4, n_arch))]
-        while len(arch_slots) < 4:
-            arch_slots.append(arch_slots[-1])  # pad with last if fewer than 4 filled
-        top4_params = jax.tree_util.tree_map(lambda x: x[jnp.array(arch_slots)], hof_params)
-        print(f'Archive replay slots: {arch_slots}')
+def _sniper_step(state, ep, pid):
+    """Send half ships from each owned planet to nearest active non-owned body."""
+    active = active_body_mask(state, ep)           # [MAX_BODIES]
+    owned  = (state.planet_owners == pid) & active # [MAX_BODIES]
+    ships  = state.planet_ships                    # [MAX_BODIES]
 
-        # Exploit replay: most-recent archive agent as champion vs exploit slots
-        has_exploiters = hof_exploit_ptr > 0
-        if has_exploiters:
-            champion_slot  = arch_slots[0]
-            champion       = jax.tree_util.tree_map(lambda x: x[champion_slot], hof_params)
-            num_exploiters = args.players - 1
-            ex_slots = [HOF_ARCHIVE_SIZE + (hof_exploit_ptr - 1 - i) % HOF_EXPLOIT_SIZE
-                        for i in range(num_exploiters)]
-            exploiters = [jax.tree_util.tree_map(lambda x, i=i: x[i], hof_params) for i in ex_slots]
-            exploit_params = jax.tree_util.tree_map(
-                lambda c, *es: jnp.stack([c, *es], axis=0), champion, *exploiters
-            )
-            print(f'Exploit replay: champion slot {champion_slot} vs exploit slots {ex_slots}')
+    coords = state.planet_coords                   # [MAX_BODIES, 2]
+    x, y   = coords[:, 0], coords[:, 1]
+    dx = x[:, None] - x[None, :]                   # [MAX_BODIES, MAX_BODIES]
+    dy = y[:, None] - y[None, :]
+    dist = jnp.sqrt(dx**2 + dy**2 + 1e-8)
 
-        print(f'Loaded HoF (gen={latest_gen}, hof_filled={hof_filled})')
-    except Exception as e:
-        print(f'Failed to load v7 HoF: {e}. Falling back to untrained network.')
-else:
-    print('Warning: No v7 HoF checkpoints found in /tmp/checkpoints_v7/. Rendering untrained network.')
+    not_mine = (state.planet_owners != pid) & active
+    dist_masked = jnp.where(not_mine[None, :], dist, 1e9)
+    target_idx  = jnp.argmin(dist_masked, axis=1) # [MAX_BODIES]
 
-if top4_params is None:
-    p_keys = jax.random.split(dummy_key, 4)
-    top4_params = jax.vmap(lambda k: nnx.split(Actor(hidden_dim=32, num_sa_layers=6, rngs=nnx.Rngs(k)))[1])(p_keys)
+    ships_to_send = (ships // 2).astype(jnp.int32)
+    target_oh = jax.nn.one_hot(target_idx, MAX_TARGETS)          # [MAX_BODIES, 64]
+    s = jnp.where(owned[:, None], ships_to_send[:, None] * target_oh, 0).astype(jnp.int32)
 
+    tgt_x = x[target_idx]
+    tgt_y = y[target_idx]
+    angle_to_tgt = jnp.arctan2(tgt_y - y, tgt_x - x)            # [MAX_BODIES]
+    a = jnp.broadcast_to(angle_to_tgt[:, None], (MAX_BODIES, MAX_TARGETS))
+    a = jnp.where(owned[:, None], a, 0.0)
 
-@functools.partial(jax.jit, static_argnames=('num_players',))
-def rollout(top4_params, random_key, num_players=4):
-    p0_params = jax.tree_util.tree_map(lambda x: x[0], top4_params)
-    p1_params = jax.tree_util.tree_map(lambda x: x[1], top4_params)
-    p2_params = jax.tree_util.tree_map(lambda x: x[2], top4_params)
-    p3_params = jax.tree_util.tree_map(lambda x: x[3], top4_params)
+    return s, a
 
-    actor_p0 = nnx.merge(actor_graph, p0_params)
-    actor_p1 = nnx.merge(actor_graph, p1_params)
-    actor_p2 = nnx.merge(actor_graph, p2_params)
-    actor_p3 = nnx.merge(actor_graph, p3_params)
+def _random_step(state, ep, pid, key):
+    """Each owned planet sends random ships to a random active planet."""
+    active = active_body_mask(state, ep)
+    owned  = (state.planet_owners == pid) & active
+    ships  = state.planet_ships
 
-    def scan_step(carry, _):
-        state, params_inner, key = carry
-        key, subkey = jax.random.split(key)
+    k1, k2, k3 = jr.split(key, 3)
+    target_idx  = jr.randint(k1, (MAX_BODIES,), 0, MAX_BODIES)
+    ship_frac   = jr.uniform(k2, (MAX_BODIES,), 0.3, 0.7)
+    ships_send  = (ships * ship_frac).astype(jnp.int32)
 
-        ages_now = state.step - params_inner.comet_spawn_steps
-        comet_active_now = params_inner.is_comet & (ages_now >= 0) & (ages_now < params_inner.body_lifespans)
-        target_active = params_inner.is_static_planet | params_inner.is_orbiting_planet | comet_active_now
-        target_mask_64 = jnp.concatenate([target_active, jnp.ones(4, dtype=bool)], axis=-1)
+    target_oh = jax.nn.one_hot(target_idx, MAX_TARGETS)
+    s = jnp.where(owned[:, None], ships_send[:, None] * target_oh, 0).astype(jnp.int32)
 
-        def run_player(pid, actor):
-            planets, fleets, p_mask, f_mask = build_obs_arrays(state, params_inner, pid, num_players)
-            logits = actor(planets, fleets, planet_mask=p_mask, fleet_mask=f_mask)
-            ships, ds_angles = logits_to_action(logits, state.planet_ships)
-            ships = jnp.where(target_mask_64[None, :], ships, 0.0)
-            state_b = jax.tree_util.tree_map(lambda x: x[None, ...], state)
-            params_b = jax.tree_util.tree_map(lambda x: x[None, ...], params_inner)
-            ships_b = ships[None, ..., :60]
-            intercept_angles = calculate_intercept_angle(state_b, params_b, ships_b)[0]
-            ds_angles_world = ds_angles + (pid * 2 * jnp.pi / num_players)
-            angles = jnp.concatenate([intercept_angles, ds_angles_world], axis=-1)
-            ships = jnp.where(ships < 1.0, 0.0, ships)
-            is_player = (state.planet_owners == pid)[..., None]
-            return jnp.where(is_player, ships, 0), jnp.where(is_player, angles, 0.0)
+    angles_raw = jr.uniform(k3, (MAX_BODIES,), -jnp.pi, jnp.pi)
+    a = jnp.broadcast_to(angles_raw[:, None], (MAX_BODIES, MAX_TARGETS))
+    a = jnp.where(owned[:, None], a, 0.0)
 
-        ships_p0, angles_p0 = run_player(0, actor_p0)
-        ships_p1, angles_p1 = run_player(1, actor_p1)
+    return s, a
 
-        if num_players == 4:
-            ships_p2, angles_p2 = run_player(2, actor_p2)
-            ships_p3, angles_p3 = run_player(3, actor_p3)
-            final_ships = ships_p0 + ships_p1 + ships_p2 + ships_p3
-            final_angles = angles_p0 + angles_p1 + angles_p2 + angles_p3
-        else:
-            final_ships = ships_p0 + ships_p1
-            final_angles = angles_p0 + angles_p1
-        env_action = EnvAction(ships=final_ships.astype(jnp.int32), angle=final_angles)
+# ── Rollout ────────────────────────────────────────────────────────────────────
+def make_rollout(actors, num_players):
+    @functools.partial(jax.jit, static_argnames=('num_players',))
+    def rollout(key, num_players=num_players):
+        def scan_step(carry, _):
+            state, ep, key = carry
+            key, sk = jr.split(key)
+            subkeys = jr.split(sk, num_players)
 
-        next_state, _, _, _ = step(state, params_inner, env_action, num_players)
-        return (next_state, params_inner, key), state
+            ages         = state.step - ep.comet_spawn_steps
+            comet_active = ep.is_comet & (ages >= 0) & (ages < ep.body_lifespans)
+            target_active = ep.is_static_planet | ep.is_orbiting_planet | comet_active
+            target_mask_64 = jnp.concatenate([target_active, jnp.ones(4, dtype=bool)], axis=-1)
 
-    init_state, params_env = setup(random_key, num_players)
-    _, history = jax.lax.scan(scan_step, (init_state, params_env, random_key), None, length=500)
-    return history, params_env
+            total_ships  = jnp.zeros((MAX_BODIES, MAX_TARGETS), dtype=jnp.int32)
+            total_angles = jnp.zeros((MAX_BODIES, MAX_TARGETS), dtype=jnp.float32)
 
+            for pid, actor in enumerate(actors):
+                is_owner = (state.planet_owners == pid)[..., None]  # [MAX_BODIES, 1]
 
-def compute_final_stats(states_list, num_players, player_labels):
-    """Return list of dicts sorted by final ship count (rank 1 = most ships)."""
+                if actor == 'sniper':
+                    s, a = _sniper_step(state, ep, pid)
+                elif actor == 'random':
+                    s, a = _random_step(state, ep, pid, subkeys[pid])
+                else:
+                    # NN actor (nnx.Module captured as closure constant)
+                    planets, fleets, p_mask, f_mask = build_obs_arrays(state, ep, pid, num_players)
+                    logits   = actor(planets, fleets, planet_mask=p_mask, fleet_mask=f_mask)
+                    nn_ships, ds_angles = logits_to_action(logits, state.planet_ships.astype(jnp.float32))
+                    nn_ships = jnp.where(target_mask_64[None, :], nn_ships, 0.0)
+                    state_b  = tree_map(lambda x: x[None], state)
+                    ep_b     = tree_map(lambda x: x[None], ep)
+                    intercept = calculate_intercept_angle(state_b, ep_b, nn_ships[None, ..., :60])[0]
+                    ds_world  = ds_angles + pid * 2.0 * jnp.pi / num_players
+                    a = jnp.concatenate([intercept, ds_world], axis=-1)
+                    s = jnp.where(nn_ships < 1.0, 0.0, nn_ships).astype(jnp.int32)
+
+                # mask inactive targets
+                s = jnp.where(target_mask_64[None, :], s, 0)
+
+                total_ships  = total_ships  + jnp.where(is_owner, s,              0)
+                total_angles = total_angles + jnp.where(is_owner, a.astype(jnp.float32), 0.0)
+
+            action = EnvAction(ships=total_ships, angle=total_angles)
+            next_state, _, _, _ = step(state, ep, action, num_players)
+            return (next_state, ep, key), state
+
+        init_state, ep = setup(key, num_players)
+        _, history = jax.lax.scan(scan_step, (init_state, ep, key), None, length=500)
+        return history, ep
+
+    return rollout
+
+print("Compiling rollout (may take 1–3 min on CPU)...")
+t0 = time.time()
+rollout_fn = make_rollout(actors, num_players)
+key = jr.PRNGKey(int(time.time()))
+history, ep = rollout_fn(key, num_players)
+print(f"Rollout complete in {time.time() - t0:.1f}s")
+
+states_list = [tree_map(lambda x: x[t], history) for t in range(500)]
+env = jax_states_to_kaggle_env(states_list, ep)
+
+# ── Final stats ────────────────────────────────────────────────────────────────
+def compute_final_stats(states_list, num_players, labels):
     final = states_list[-1]
-    # Debug: dump all active fleets at the final frame
-    active_mask = final.fleet_owners != -1
-    active_owners = jnp.where(active_mask, final.fleet_owners, -999)
-    active_ships  = jnp.where(active_mask, final.fleet_ship_count, 0)
-    nonzero = jnp.where(active_mask)[0]
-    print(f"  [debug] final state step={int(final.step)}, active fleets={int(jnp.sum(active_mask))}")
-    for idx in nonzero[:20]:  # cap at 20 so it doesn't flood output
-        print(f"    fleet[{int(idx)}]: owner={int(final.fleet_owners[idx])}, ships={int(final.fleet_ship_count[idx])}")
     results = []
     for pid in range(num_players):
         p_ships = int(jnp.sum(jnp.where(final.planet_owners == pid, final.planet_ships, 0)))
-        f_ships = int(jnp.sum(jnp.where(final.fleet_owners == pid, final.fleet_ship_count, 0)))
+        f_ships = int(jnp.sum(jnp.where(final.fleet_owners  == pid, final.fleet_ship_count, 0)))
         results.append({
-            'player': pid,
-            'name': player_labels[pid],
-            'color': PLAYER_COLORS[pid],
-            'planet_ships': p_ships,
-            'fleet_ships': f_ships,
-            'total': p_ships + f_ships,
+            'player': pid, 'name': labels[pid], 'color': PLAYER_COLORS[pid],
+            'planet_ships': p_ships, 'fleet_ships': f_ships, 'total': p_ships + f_ships,
         })
     results.sort(key=lambda x: -x['total'])
     for rank, r in enumerate(results):
         r['rank'] = rank + 1
     return results
 
+stats = compute_final_stats(states_list, num_players, agent_labels)
+print("Final standings:", [(r['name'], r['rank'], r['total']) for r in stats])
 
+# ── Write outputs ──────────────────────────────────────────────────────────────
 os.makedirs("public", exist_ok=True)
 
-has_exploit = exploit_params is not None
-
-PLAYER_LABELS = {
-    'ffa-archive':  [f'Archive #{i+1}' for i in range(args.players)],
-    'ffa-exploit':  ['Champion'] + [f'Exploiter {i+1}' for i in range(args.players - 1)],
-    'duel-archive': ['Archive #1', 'Archive #2'],
-    'duel-exploit': ['Champion', 'Exploiter'],
-}
-
-all_stats = {}
-
-# --- FFA archive replay ---
-print("Simulating FFA archive replay (500 steps)...")
-key_ffa_arch = dummy_key
-history, params = rollout(top4_params, key_ffa_arch, args.players)
-states_list = [tree_map(lambda x: x[t], history) for t in range(500)]
-env = jax_states_to_kaggle_env(states_list, params)
-all_stats['ffa-archive'] = compute_final_stats(states_list, args.players, PLAYER_LABELS['ffa-archive'])
-print("Rendering FFA archive HTML...")
 with open("public/orbit_wars_replay.html", "w") as f:
     f.write(env.render(mode="html", width=800, height=800))
 print("Written: public/orbit_wars_replay.html")
 
-# --- Duel archive replay ---
-print("Simulating Duel archive replay (500 steps)...")
-key_duel_arch = jax.random.PRNGKey(int(_time.time()) + 2)
-history_da, params_da = rollout(top4_params, key_duel_arch, 2)
-states_list_da = [tree_map(lambda x: x[t], history_da) for t in range(500)]
-env_da = jax_states_to_kaggle_env(states_list_da, params_da)
-all_stats['duel-archive'] = compute_final_stats(states_list_da, 2, PLAYER_LABELS['duel-archive'])
-print("Rendering Duel archive HTML...")
-with open("public/orbit_wars_replay_duel.html", "w") as f:
-    f.write(env_da.render(mode="html", width=800, height=800))
-print("Written: public/orbit_wars_replay_duel.html")
-
-# --- FFA exploit replay ---
-if has_exploit:
-    key_ffa_ex = jax.random.PRNGKey(int(_time.time()) + 1)
-    print("Simulating FFA exploit replay (500 steps)...")
-    history_ex, params_ex = rollout(exploit_params, key_ffa_ex, args.players)
-    states_list_ex = [tree_map(lambda x: x[t], history_ex) for t in range(500)]
-    env_ex = jax_states_to_kaggle_env(states_list_ex, params_ex)
-    all_stats['ffa-exploit'] = compute_final_stats(states_list_ex, args.players, PLAYER_LABELS['ffa-exploit'])
-    print("Rendering FFA exploit HTML...")
-    with open("public/orbit_wars_replay_exploit.html", "w") as f:
-        f.write(env_ex.render(mode="html", width=800, height=800))
-    print("Written: public/orbit_wars_replay_exploit.html")
-
-    # --- Duel exploit replay ---
-    key_duel_ex = jax.random.PRNGKey(int(_time.time()) + 3)
-    print("Simulating Duel exploit replay (500 steps)...")
-    history_de, params_de = rollout(exploit_params, key_duel_ex, 2)
-    states_list_de = [tree_map(lambda x: x[t], history_de) for t in range(500)]
-    env_de = jax_states_to_kaggle_env(states_list_de, params_de)
-    all_stats['duel-exploit'] = compute_final_stats(states_list_de, 2, PLAYER_LABELS['duel-exploit'])
-    print("Rendering Duel exploit HTML...")
-    with open("public/orbit_wars_replay_duel_exploit.html", "w") as f:
-        f.write(env_de.render(mode="html", width=800, height=800))
-    print("Written: public/orbit_wars_replay_duel_exploit.html")
-
-
-# --- Legend helpers ---
-def swatch(color, i):
-    border = 'border:1.5px solid #777;' if i == 3 else ''
-    return f'<span class="swatch" style="background:{color};{border}"></span>'
-
-
-def legend_html(labels, num):
-    items = ''.join(
-        f'<div class="legend-item">{swatch(PLAYER_COLORS[i], i)}{label}</div>'
-        for i, label in enumerate(labels[:num])
-    )
-    return f'<div class="legend">{items}</div>'
-
-
-ALL_LEGEND_LABELS = {
-    'ffa-archive':  [f'P{i+1} · Archive #{i+1}' for i in range(args.players)],
-    'ffa-exploit':  ['P1 · Champion'] + [f'P{i+2} · Exploiter' for i in range(args.players - 1)],
-    'duel-archive': ['P1 · Archive #1', 'P2 · Archive #2'],
-    'duel-exploit': ['P1 · Champion', 'P2 · Exploiter'],
+meta = {
+    'players':      num_players,
+    'agents':       args.agents,
+    'labels':       agent_labels,
+    'stats':        stats,
+    'generated_at': time.time(),
 }
-
-SRCS = {
-    'ffa-archive':  'orbit_wars_replay.html',
-    'ffa-exploit':  'orbit_wars_replay_exploit.html',
-    'duel-archive': 'orbit_wars_replay_duel.html',
-    'duel-exploit': 'orbit_wars_replay_duel_exploit.html',
-}
-
-exploit_disabled_attr = '' if has_exploit else 'disabled title="No exploiter checkpoint found"'
-
-legends_js = {
-    k: legend_html(v, 4 if k.startswith('ffa') else 2)
-    for k, v in ALL_LEGEND_LABELS.items()
-}
-
-
-def js_obj(d):
-    pairs = ', '.join(f'"{k}": `{v}`' for k, v in d.items())
-    return '{' + pairs + '}'
-
-
-srcs_js = js_obj(SRCS)
-legends_js_str = js_obj(legends_js)
-stats_js = json.dumps(all_stats)
-
-index_html = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-<title>OrbitWars AI Dashboard</title>
-<style>
-  :root {{
-    --primary: #6366f1;
-    --primary-hover: #4f46e5;
-    --bg-dark: #0f172a;
-    --glass-bg: rgba(30, 41, 59, 0.7);
-    --glass-border: rgba(255, 255, 255, 0.1);
-  }}
-
-  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-
-  body {{
-    font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
-    background-color: var(--bg-dark);
-    color: white;
-    min-height: 100vh;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    background-image: radial-gradient(circle at 50% 0%, #1e1b4b 0%, var(--bg-dark) 50%);
-    padding: 0 env(safe-area-inset-right) 0 env(safe-area-inset-left);
-  }}
-
-  header {{
-    margin-top: clamp(1rem, 4vw, 2.5rem);
-    margin-bottom: clamp(0.75rem, 3vw, 1.5rem);
-    text-align: center;
-    padding: 0 1rem;
-  }}
-
-  h1 {{
-    font-size: clamp(1.4rem, 5vw, 2.5rem);
-    font-weight: 800;
-    margin: 0;
-    background: linear-gradient(to right, #818cf8, #c084fc);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    letter-spacing: -0.05em;
-  }}
-
-  p.subtitle {{
-    color: #94a3b8;
-    margin-top: 0.4rem;
-    font-size: clamp(0.75rem, 2.5vw, 1rem);
-  }}
-
-  @media (max-width: 480px) {{
-    p.subtitle {{ display: none; }}
-  }}
-
-  .controls {{
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.5rem;
-    margin-bottom: 0.75rem;
-    align-items: center;
-    justify-content: center;
-    z-index: 10;
-    padding: 0 0.75rem;
-    width: 100%;
-  }}
-
-  .toggle-group {{
-    display: flex;
-    background: rgba(15, 23, 42, 0.6);
-    border: 1px solid var(--glass-border);
-    border-radius: 9999px;
-    padding: 3px;
-    backdrop-filter: blur(10px);
-  }}
-
-  .toggle-btn {{
-    background: transparent;
-    border: none;
-    color: #94a3b8;
-    padding: clamp(0.3rem, 1.5vw, 0.5rem) clamp(0.6rem, 2.5vw, 1.1rem);
-    border-radius: 9999px;
-    font-size: clamp(0.75rem, 2.5vw, 0.9rem);
-    font-weight: 600;
-    cursor: pointer;
-    transition: all 0.2s ease-in-out;
-    white-space: nowrap;
-    -webkit-tap-highlight-color: transparent;
-  }}
-
-  .toggle-btn:hover:not(:disabled) {{ color: #e2e8f0; }}
-
-  .toggle-btn.active {{
-    background: var(--glass-bg);
-    color: white;
-    box-shadow: 0 2px 8px rgba(0,0,0,0.3);
-  }}
-
-  .toggle-btn:disabled {{ opacity: 0.35; cursor: not-allowed; }}
-
-  button.primary-btn {{
-    background: var(--primary);
-    border: none;
-    color: white;
-    padding: clamp(0.4rem, 1.5vw, 0.6rem) clamp(0.9rem, 3vw, 1.4rem);
-    border-radius: 9999px;
-    font-size: clamp(0.75rem, 2.5vw, 0.9rem);
-    font-weight: 600;
-    cursor: pointer;
-    transition: all 0.2s ease-in-out;
-    box-shadow: 0 4px 6px -1px rgba(0,0,0,0.2);
-    -webkit-tap-highlight-color: transparent;
-  }}
-
-  button.primary-btn:hover {{
-    background: var(--primary-hover);
-    transform: translateY(-2px);
-    box-shadow: 0 8px 15px -3px rgba(99,102,241,0.4);
-  }}
-
-  button.primary-btn:active {{ transform: translateY(0); }}
-
-  .legend {{
-    display: flex;
-    flex-wrap: wrap;
-    gap: 10px;
-    align-items: center;
-    justify-content: center;
-    margin-bottom: 0.6rem;
-    min-height: 20px;
-    padding: 0 0.75rem;
-  }}
-
-  .legend-item {{
-    display: flex;
-    align-items: center;
-    gap: 5px;
-    font-size: clamp(0.7rem, 2vw, 0.8rem);
-    color: #94a3b8;
-    white-space: nowrap;
-  }}
-
-  .swatch {{
-    width: 9px;
-    height: 9px;
-    border-radius: 50%;
-    flex-shrink: 0;
-  }}
-
-  /* Glass container: square, capped at 700px, responsive on mobile */
-  .glass-container {{
-    width: min(700px, calc(100vw - 1.5rem));
-    max-width: 900px;
-    aspect-ratio: 1;
-    background: var(--glass-bg);
-    border: 1px solid var(--glass-border);
-    border-radius: clamp(12px, 3vw, 24px);
-    overflow: hidden;
-    backdrop-filter: blur(12px);
-    box-shadow: 0 25px 50px -12px rgba(0,0,0,0.5);
-    position: relative;
-    margin-bottom: 1rem;
-  }}
-
-  /* Iframes are fixed 800×800 (Kaggle renderer); JS scales them to fit */
-  iframe {{
-    position: absolute;
-    top: 0;
-    left: 0;
-    width: 800px;
-    height: 800px;
-    border: none;
-    transform-origin: top left;
-  }}
-
-  .loading-overlay {{
-    position: absolute;
-    inset: 0;
-    background: rgba(15, 23, 42, 0.88);
-    backdrop-filter: blur(8px);
-    display: flex;
-    flex-direction: column;
-    justify-content: center;
-    align-items: center;
-    opacity: 0;
-    pointer-events: none;
-    transition: opacity 0.3s ease;
-    z-index: 20;
-    border-radius: inherit;
-    padding: 1rem;
-    text-align: center;
-  }}
-
-  .loading-overlay.active {{ opacity: 1; pointer-events: all; }}
-
-  .spinner {{
-    width: 44px;
-    height: 44px;
-    border: 4px solid rgba(99, 102, 241, 0.25);
-    border-radius: 50%;
-    border-top-color: var(--primary);
-    animation: spin 1s ease-in-out infinite;
-    margin-bottom: 1.25rem;
-    flex-shrink: 0;
-  }}
-
-  @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
-
-  .loading-text {{
-    font-size: clamp(0.85rem, 3vw, 1.1rem);
-    font-weight: 600;
-    color: #e2e8f0;
-    margin-bottom: 1rem;
-  }}
-
-  .progress-bar-container {{
-    width: min(55%, 240px);
-    height: 6px;
-    background: rgba(255,255,255,0.1);
-    border-radius: 9999px;
-    overflow: hidden;
-  }}
-
-  .progress-bar {{
-    height: 100%;
-    width: 0%;
-    background: linear-gradient(to right, #6366f1, #a855f7);
-    border-radius: 9999px;
-    transition: width 1s linear;
-  }}
-
-  .progress-hint {{
-    color: #64748b;
-    font-size: 0.75rem;
-    margin-top: 0.75rem;
-  }}
-
-  /* Results panel */
-  .results-panel {{
-    width: min(90%, calc(100vw - 1.5rem));
-    max-width: 900px;
-    background: var(--glass-bg);
-    border: 1px solid var(--glass-border);
-    border-radius: clamp(10px, 2.5vw, 16px);
-    backdrop-filter: blur(12px);
-    padding: 0.85rem 1rem;
-    margin-bottom: 2rem;
-  }}
-
-  .results-title {{
-    font-size: 0.7rem;
-    font-weight: 700;
-    letter-spacing: 0.1em;
-    text-transform: uppercase;
-    color: #64748b;
-    margin-bottom: 0.65rem;
-  }}
-
-  .results-row {{
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    padding: 0.35rem 0;
-    border-bottom: 1px solid rgba(255,255,255,0.04);
-  }}
-
-  .results-row:last-child {{ border-bottom: none; }}
-
-  .rank-badge {{
-    width: 20px;
-    font-size: 0.75rem;
-    font-weight: 700;
-    color: #64748b;
-    flex-shrink: 0;
-    text-align: center;
-  }}
-
-  .rank-badge.gold   {{ color: #fbbf24; }}
-  .rank-badge.silver {{ color: #94a3b8; }}
-  .rank-badge.bronze {{ color: #b45309; }}
-
-  .result-name {{
-    flex: 1;
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    font-size: clamp(0.75rem, 2.5vw, 0.85rem);
-    font-weight: 600;
-    color: #e2e8f0;
-    min-width: 0;
-  }}
-
-  .result-name span:last-child {{
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }}
-
-  .ship-bar-wrap {{
-    flex: 2;
-    height: 5px;
-    background: rgba(255,255,255,0.06);
-    border-radius: 9999px;
-    overflow: hidden;
-    min-width: 40px;
-  }}
-
-  @media (max-width: 380px) {{
-    .ship-bar-wrap {{ display: none; }}
-  }}
-
-  .ship-bar {{
-    height: 100%;
-    border-radius: 9999px;
-    transition: width 0.4s ease;
-  }}
-
-  .ship-count {{
-    font-size: clamp(0.7rem, 2vw, 0.8rem);
-    color: #94a3b8;
-    white-space: nowrap;
-    flex-shrink: 0;
-  }}
-</style>
-</head>
-<body>
-
-<header>
-  <h1>OrbitWars AI Dashboard</h1>
-  <p class="subtitle">Live continuous monitoring of the TPU Reinforcement Learning Cluster</p>
-</header>
-
-<div class="controls">
-  <div class="toggle-group">
-    <button class="toggle-btn active" id="btn-ffa"  onclick="setMode('ffa')">FFA (4-way)</button>
-    <button class="toggle-btn"        id="btn-duel" onclick="setMode('duel')">Duel (2-way)</button>
-  </div>
-  <div class="toggle-group">
-    <button class="toggle-btn active" id="btn-archive" onclick="setType('archive')">Archive</button>
-    <button class="toggle-btn" id="btn-exploit" onclick="setType('exploit')" {exploit_disabled_attr}>Champion vs Exploiters</button>
-  </div>
-  <button class="primary-btn" onclick="triggerSimulation()">&#128640; New Game</button>
-</div>
-
-<div id="legend-wrapper">{legend_html(ALL_LEGEND_LABELS['ffa-archive'], 4)}</div>
-
-<div class="glass-container" id="glass-container">
-  <div class="loading-overlay" id="loadingOverlay">
-    <div class="spinner"></div>
-    <div class="loading-text" id="loadingText">Compiling JAX XLA Graphs...</div>
-    <div class="progress-bar-container">
-      <div class="progress-bar" id="progressBar"></div>
-    </div>
-    <p class="progress-hint">This process takes approximately 3 minutes.</p>
-  </div>
-  <iframe id="frame-ffa-archive"  src="orbit_wars_replay.html" style="display:block"></iframe>
-  <iframe id="frame-ffa-exploit"  src="" style="display:none"></iframe>
-  <iframe id="frame-duel-archive" src="" style="display:none"></iframe>
-  <iframe id="frame-duel-exploit" src="" style="display:none"></iframe>
-</div>
-
-<div class="results-panel" id="results-panel">
-  <div class="results-title">Final Results · 500 Steps</div>
-  <div id="results-rows"></div>
-</div>
-
-<script>
-  const EXPLOIT_AVAILABLE = {'true' if has_exploit else 'false'};
-  const SRCS    = {srcs_js};
-  const LEGENDS = {legends_js_str};
-  const STATS   = {stats_js};
-
-  let currentMode = 'ffa';
-  let currentType = 'archive';
-  const loaded = {{'ffa-archive': true, 'ffa-exploit': false, 'duel-archive': false, 'duel-exploit': false}};
-
-  const RANK_CLASSES = ['gold', 'silver', 'bronze', ''];
-  const RANK_SYMBOLS = ['#1', '#2', '#3', '#4'];
-
-  function currentKey() {{ return currentMode + '-' + currentType; }}
-
-  // Scale all iframes so the 800×800 Kaggle render fills the container
-  const IFRAME_SIZE = 800;
-  function scaleIframes() {{
-    const c = document.getElementById('glass-container');
-    const scale = Math.min(c.clientWidth / IFRAME_SIZE, c.clientHeight / IFRAME_SIZE);
-    const ox = (c.clientWidth  - IFRAME_SIZE * scale) / 2;
-    const oy = (c.clientHeight - IFRAME_SIZE * scale) / 2;
-    document.querySelectorAll('iframe').forEach(f => {{
-      f.style.transform = `scale(${{scale}})`;
-      f.style.left = ox + 'px';
-      f.style.top  = oy + 'px';
-    }});
-  }}
-
-  window.addEventListener('resize', scaleIframes);
-  scaleIframes(); // script is at end of body — DOM and CSS are already applied
-
-  function renderStats(key) {{
-    const rows = STATS[key];
-    if (!rows || !rows.length) {{
-      document.getElementById('results-panel').style.display = 'none';
-      return;
-    }}
-    document.getElementById('results-panel').style.display = '';
-    const maxTotal = Math.max(...rows.map(r => r.total), 1);
-    document.getElementById('results-rows').innerHTML = rows.map(r => {{
-      const pct = Math.round(r.total / maxTotal * 100);
-      const rankClass = RANK_CLASSES[r.rank - 1] || '';
-      const symbol = RANK_SYMBOLS[r.rank - 1] || '#' + r.rank;
-      const border = r.player === 3 ? 'border:1.5px solid #777;' : '';
-      return `<div class="results-row">
-        <span class="rank-badge ${{rankClass}}">${{symbol}}</span>
-        <span class="result-name">
-          <span style="background:${{r.color}};${{border}}width:9px;height:9px;border-radius:50%;flex-shrink:0;display:inline-block"></span>
-          <span>P${{r.player + 1}} · ${{r.name}}</span>
-        </span>
-        <div class="ship-bar-wrap">
-          <div class="ship-bar" style="width:${{pct}}%;background:${{r.color}}"></div>
-        </div>
-        <span class="ship-count">${{r.total.toLocaleString()}}</span>
-      </div>`;
-    }}).join('');
-  }}
-
-  function updateView() {{
-    const key = currentKey();
-    ['ffa-archive','ffa-exploit','duel-archive','duel-exploit'].forEach(k => {{
-      document.getElementById('frame-' + k).style.display = k === key ? 'block' : 'none';
-    }});
-    if (!loaded[key]) {{
-      document.getElementById('frame-' + key).src = SRCS[key];
-      loaded[key] = true;
-    }}
-    document.getElementById('legend-wrapper').innerHTML = LEGENDS[key];
-    renderStats(key);
-    scaleIframes();
-
-    document.getElementById('btn-ffa').className    = 'toggle-btn' + (currentMode === 'ffa'   ? ' active' : '');
-    document.getElementById('btn-duel').className   = 'toggle-btn' + (currentMode === 'duel'  ? ' active' : '');
-    document.getElementById('btn-archive').className = 'toggle-btn' + (currentType === 'archive' ? ' active' : '');
-    document.getElementById('btn-exploit').className = 'toggle-btn'
-      + (!EXPLOIT_AVAILABLE ? '' : currentType === 'exploit' ? ' active' : '');
-  }}
-
-  function setMode(mode) {{
-    currentMode = mode;
-    if (!EXPLOIT_AVAILABLE && currentType === 'exploit') currentType = 'archive';
-    updateView();
-  }}
-
-  function setType(type) {{
-    if (type === 'exploit' && !EXPLOIT_AVAILABLE) return;
-    currentType = type;
-    updateView();
-  }}
-
-  const CLOUDFLARE_WORKER_URL = '{CLOUDFLARE_WORKER_URL}';
-
-  async function triggerSimulation() {{
-    const overlay    = document.getElementById('loadingOverlay');
-    const progressBar = document.getElementById('progressBar');
-    const loadingText = document.getElementById('loadingText');
-
-    overlay.classList.add('active');
-    progressBar.style.width = '0%';
-    loadingText.textContent = 'Triggering simulation...';
-
-    try {{
-      const response = await fetch(CLOUDFLARE_WORKER_URL, {{
-        method: 'POST',
-        headers: {{ 'Content-Type': 'application/json' }},
-        body: JSON.stringify({{ players: 4 }})
-      }});
-
-      if (!response.ok) throw new Error('API error ' + response.status);
-
-      let progress = 0;
-      loadingText.textContent = 'Simulating 4-Way Free-For-All...';
-
-      const interval = setInterval(() => {{
-        progress += 100 / 180;
-        if (progress >= 30  && progress < 60)  loadingText.textContent = 'Downloading latest R2 checkpoints...';
-        if (progress >= 60  && progress < 90)  loadingText.textContent = 'Executing physics engine rollout...';
-        if (progress >= 90  && progress < 120) loadingText.textContent = 'Rendering interactive HTML...';
-        if (progress >= 120)                   loadingText.textContent = 'Deploying to GitHub Pages...';
-
-        if (progress >= 100) {{
-          clearInterval(interval);
-          progressBar.style.width = '100%';
-          setTimeout(() => {{
-            // Full page reload so fresh index.html (with updated STATS) is fetched
-            window.location.href = window.location.pathname + '?t=' + Date.now();
-          }}, 5000);
-        }} else {{
-          progressBar.style.width = progress + '%';
-        }}
-      }}, 1000);
-
-    }} catch (err) {{
-      console.error(err);
-      loadingText.textContent = 'Error: Failed to connect to API Gateway.';
-      setTimeout(() => overlay.classList.remove('active'), 3000);
-    }}
-  }}
-
-  renderStats('ffa-archive');
-</script>
-</body>
-</html>"""
-
-with open("public/index.html", "w") as f:
-    f.write(index_html)
-print("Written: public/index.html")
-print("Done. Open public/index.html to view.")
+with open("public/replay_meta.json", "w") as f:
+    json.dump(meta, f, indent=2)
+print("Written: public/replay_meta.json")
+print("Done.")
