@@ -103,7 +103,7 @@ jobs:
           bucket = os.environ['R2_BUCKET_NAME']
           players = int(os.environ.get('PLAYERS', 4))
           try:
-              obj = s3.get_object(Bucket=bucket, Key='rl_v24/hof_index.json')
+              obj = s3.get_object(Bucket=bucket, Key='rl_v25/hof_index.json')
               idx = json.loads(obj['Body'].read())
               entries = idx.get('entries_4p' if players == 4 else 'entries_2p', [])
               entries = sorted(entries, key=lambda e: e['elo'], reverse=True)
@@ -217,7 +217,7 @@ jobs:
               region_name='auto')
           bucket = os.environ['R2_BUCKET_NAME']
           try:
-              obj = s3.get_object(Bucket=bucket, Key='rl_v24/hof_index.json')
+              obj = s3.get_object(Bucket=bucket, Key='rl_v25/hof_index.json')
               os.makedirs('public', exist_ok=True)
               with open('public/hof_index.json', 'wb') as f:
                   f.write(obj['Body'].read())

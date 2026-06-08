@@ -7,7 +7,7 @@ const CORS = {
 
 const GITHUB_OWNER = 'RaameshB';
 const GITHUB_REPO  = 'OrbitWars';
-const R2_KEY       = 'rl_v24/hof_index.json';
+const R2_KEY       = 'rl_v25/hof_index.json';
 
 // UUID-ish safety check — only allow alphanumeric + hyphens, 8-64 chars
 function safeReqId(s) {
