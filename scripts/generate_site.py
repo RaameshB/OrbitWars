@@ -67,10 +67,10 @@ def np_to_params(np_dict):
 
 # ── Load a HoF agent from R2 ───────────────────────────────────────────────────
 def load_hof_actor(tag):
-    # Prefer the mode matching the game type; fall back to the other.
-    modes = ['2p', '4p'] if num_players == 2 else ['4p', '2p']
-    for mode in modes:
-        key = f'{R2_PREFIX}/hof/{mode}/{tag}.pkl'
+    # Check mode-specific folders first (for legacy compatibility), then the flat folder.
+    modes = ['4p', '2p'] if num_players == 4 else ['2p', '4p']
+    keys_to_try = [f'{R2_PREFIX}/hof/{mode}/{tag}.pkl' for mode in modes] + [f'{R2_PREFIX}/hof/{tag}.pkl']
+    for key in keys_to_try:
         local = f'/tmp/hof_agent_{tag}.pkl'
         try:
             print(f'  Downloading {key} ...')
@@ -80,8 +80,8 @@ def load_hof_actor(tag):
             params_np = raw['params'] if isinstance(raw, dict) and 'params' in raw else raw
             return nnx.merge(actor_graph, np_to_params(params_np))
         except Exception as e:
-            print(f'  Not found in {mode}: {e}')
-    raise RuntimeError(f'Could not load agent "{tag}" from R2 in any mode.')
+            print(f'  Not found at {key}: {e}')
+    raise RuntimeError(f'Could not load agent "{tag}" from R2 (checked flat and mode dirs).')
 
 # ── Build per-player agent list ────────────────────────────────────────────────
 actors = []
