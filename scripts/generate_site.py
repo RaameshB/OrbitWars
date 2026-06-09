@@ -67,9 +67,13 @@ def np_to_params(np_dict):
 
 # ── Load a HoF agent from R2 ───────────────────────────────────────────────────
 def load_hof_actor(tag):
-    # Check mode-specific folders first (for legacy compatibility), then the flat folder.
     modes = ['4p', '2p'] if num_players == 4 else ['2p', '4p']
-    keys_to_try = [f'{R2_PREFIX}/hof/{mode}/{tag}.pkl' for mode in modes] + [f'{R2_PREFIX}/hof/{tag}.pkl']
+    
+    # Legacy tags on R2 don't actually have the 'legacy_' prefix in their filenames
+    # because the migration script preserved the original v24 filenames.
+    file_tag = tag[7:] if tag.startswith('legacy_') else tag
+    
+    keys_to_try = [f'{R2_PREFIX}/hof/{mode}/{file_tag}.pkl' for mode in modes] + [f'{R2_PREFIX}/hof/{file_tag}.pkl']
     for key in keys_to_try:
         local = f'/tmp/hof_agent_{tag}.pkl'
         try:
